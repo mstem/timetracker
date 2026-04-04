@@ -1,0 +1,5 @@
+{
+  "api_key": "<your Clockify API key>",
+  "workspace_id": "<your workspace ID>",
+  "project_id": "<optional default project ID — leave blank or remove this key>"
+}
