@@ -1,5 +1,9 @@
 # Terminal Time Tracker
 
+Vibecoding and jumping between 12 different terminal windows kind of obliterates traditional time tracking across projects. This little script hopes to return a little bit of automated-tracking sanity to your logs so you can get a sense of roughly where your time went when the hours pass.
+
+It triggers only after at least 5 seconds in a window, so it will only catch project entries where you did more than hit enter blindly without thinking.
+
 Automatically tracks time spent in Terminal.app windows and syncs daily totals to [Clockify](https://clockify.me). Runs as a macOS background daemon (launchd), polls every 2 seconds, and sends aggregated entries at midnight.
 
 **macOS only** — uses AppleScript to detect the active Terminal window.
