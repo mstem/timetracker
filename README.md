@@ -109,12 +109,14 @@ Mappings are saved in `project_mappings.json` (gitignored — stays local).
    ```json
    { "anthropic_api_key": "sk-ant-..." }
    ```
-3. Re-run `setup.sh` — it will install a weekly launchd agent (every Monday at 9:00am).
+3. Re-run `setup.sh` — it installs two launchd agents:
+   - **Monday 9am**: auto-runs `ai_matcher.py` to save high-confidence matches
+   - **Friday 4pm**: fires a macOS notification reminding you to do the interactive review
 
 ### Manual usage
 
 ```bash
-# Match unmatched dirnames from the last 7 days
+# Match unmatched dirnames from the last 7 days (auto-saves confident matches)
 python3 ai_matcher.py
 
 # Preview matches without saving anything
@@ -123,12 +125,26 @@ python3 ai_matcher.py --dry-run
 # Look back further
 python3 ai_matcher.py --days 30
 
-# Propose each match and confirm interactively (y/n or type a project name)
+# Walk through each match interactively — confirm, override, or create new projects
 python3 ai_matcher.py --interactive
 
 # Link a dirname to a project by name — no AI needed, fuzzy match
 python3 ai_matcher.py --link my-project-dir "My Project Name"
 ```
+
+### Interactive mode
+
+`--interactive` shows your full project list grouped by client, then walks through each unmatched dirname one at a time:
+
+```
+  ctfg-timeliness  →  VA CTFG
+    [y/n/back/project name]: 
+```
+
+- `y` or Enter — accept the proposed match
+- `n` — skip (will retry next run)
+- `back` — go back and redo the previous dirname
+- type a name — fuzzy-matches against your existing projects; if nothing matches, offers to **create a new Clockify project** on the spot
 
 ### How it works
 
@@ -137,7 +153,7 @@ python3 ai_matcher.py --link my-project-dir "My Project Name"
 - Sends all unmatched names + all your Clockify project names to Claude in **one API call**
 - Claude returns a JSON match for each dirname; conservative — prefers `null` over a weak guess
 - Confirmed matches are written to `project_mappings.json`
-- Dirnames where Claude returns no match remain unmatched and are retried on the next weekly run
+- Dirnames where Claude returns no match remain unmatched and are retried on the next run
 
 ## Claude Code hook (optional)
 
