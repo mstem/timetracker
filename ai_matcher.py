@@ -301,16 +301,15 @@ def confirm_match(dirname: str, project: dict, projects: list, config: dict):
 
 
 def print_projects_by_client(projects: list):
-    """Print all Clockify projects grouped by client."""
+    """Print all Clockify projects grouped by client, one line per client."""
     by_client = {}
     for p in projects:
         client = p.get("clientName") or "No client"
         by_client.setdefault(client, []).append(p["name"])
     print("── Clockify projects ──────────────────────────")
     for client in sorted(by_client):
-        print(f"  {client}")
-        for name in sorted(by_client[client]):
-            print(f"    • {name}")
+        names = ",  ".join(sorted(by_client[client]))
+        print(f"  {client}:  {names}")
     print("───────────────────────────────────────────────\n")
 
 

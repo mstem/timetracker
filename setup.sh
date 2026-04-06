@@ -56,6 +56,43 @@ echo "  Logs:    tail -f $SCRIPT_DIR/tracker.log"
 echo "  Send now: python3 $SCRIPT_DIR/tracker.py --send-today"
 
 # ---------------------------------------------------------------------------
+# Friday 4pm Clockify review reminder
+# ---------------------------------------------------------------------------
+REMINDER_PLIST_NAME="com.terminaltracker.reminder"
+REMINDER_PLIST_SRC="$SCRIPT_DIR/$REMINDER_PLIST_NAME.plist"
+REMINDER_PLIST_DST="$HOME/Library/LaunchAgents/$REMINDER_PLIST_NAME.plist"
+
+cat > "$REMINDER_PLIST_SRC" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$REMINDER_PLIST_NAME</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$SCRIPT_DIR/clockify_reminder.sh</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>5</integer>
+        <key>Hour</key>
+        <integer>16</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+</dict>
+</plist>
+EOF
+
+cp "$REMINDER_PLIST_SRC" "$REMINDER_PLIST_DST"
+launchctl unload "$REMINDER_PLIST_DST" 2>/dev/null || true
+launchctl load "$REMINDER_PLIST_DST"
+echo "==> Friday 4pm reminder installed."
+
+# ---------------------------------------------------------------------------
 # Optional: AI project matcher (weekly launchd agent)
 # ---------------------------------------------------------------------------
 AI_PLIST_NAME="com.terminaltracker.aimatcher"
