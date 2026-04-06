@@ -98,6 +98,47 @@ python3 tracker.py --map my-project-dir abc123projectid
 
 Mappings are saved in `project_mappings.json` (gitignored — stays local).
 
+## AI-powered project matching (optional)
+
+`ai_matcher.py` scans your recent logs, finds directory names with no Clockify mapping, and asks Claude to match them against your projects — all in one batch API call. Matched results are saved to `project_mappings.json` and never re-queried.
+
+### Setup
+
+1. Get an [Anthropic API key](https://console.anthropic.com/)
+2. Add it to `config.json`:
+   ```json
+   { "anthropic_api_key": "sk-ant-..." }
+   ```
+3. Re-run `setup.sh` — it will install a weekly launchd agent (every Monday at 9:00am).
+
+### Manual usage
+
+```bash
+# Match unmatched dirnames from the last 7 days
+python3 ai_matcher.py
+
+# Preview matches without saving anything
+python3 ai_matcher.py --dry-run
+
+# Look back further
+python3 ai_matcher.py --days 30
+
+# Propose each match and confirm interactively (y/n or type a project name)
+python3 ai_matcher.py --interactive
+
+# Link a dirname to a project by name — no AI needed, fuzzy match
+python3 ai_matcher.py --link my-project-dir "My Project Name"
+```
+
+### How it works
+
+- Scans log files for the last N days (default 7)
+- Extracts directory names from window titles (same logic as the tracker)
+- Sends all unmatched names + all your Clockify project names to Claude in **one API call**
+- Claude returns a JSON match for each dirname; conservative — prefers `null` over a weak guess
+- Confirmed matches are written to `project_mappings.json`
+- Dirnames where Claude returns no match remain unmatched and are retried on the next weekly run
+
 ## Claude Code hook (optional)
 
 `check_clockify_mapping.py` is a Claude Code `UserPromptSubmit` hook. When you open a project in Claude Code that has no Clockify mapping yet, it prompts Claude to ask you which project to associate before proceeding.

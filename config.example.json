@@ -1,5 +1,6 @@
 {
   "api_key": "<your Clockify API key>",
   "workspace_id": "<your workspace ID>",
-  "project_id": "<optional default project ID — leave blank or remove this key>"
+  "project_id": "<optional default project ID — leave blank or remove this key>",
+  "anthropic_api_key": "<optional — enables AI-powered bulk project matching via ai_matcher.py>"
 }
