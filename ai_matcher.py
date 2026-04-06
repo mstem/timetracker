@@ -35,6 +35,9 @@ DEFAULT_DAYS      = 7
 # Directory names that are shell/OS artifacts, not project directories
 SKIP_DIRNAMES = {"Terminal", "home", "~", "Desktop", "Downloads", "Documents"}
 
+# Sentinel returned from interactive prompts to signal "go back to previous item"
+GO_BACK = object()
+
 logging.basicConfig(
     filename=LOG_FILE,
     level=logging.INFO,
@@ -156,6 +159,16 @@ def list_clockify_projects(config: dict) -> list:
     )
 
 
+def create_clockify_project(config: dict, name: str) -> dict:
+    """Create a new Clockify project and return it."""
+    return clockify_request(
+        "POST",
+        f"/workspaces/{config['workspace_id']}/projects",
+        config["api_key"],
+        {"name": name, "billable": False},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Anthropic / Claude
 # ---------------------------------------------------------------------------
@@ -271,23 +284,57 @@ def fuzzy_find_project(name_query: str, projects: list) -> dict | None:
 # Interactive confirmation
 # ---------------------------------------------------------------------------
 
-def confirm_match(dirname: str, project: dict, projects: list) -> dict | None:
+def confirm_match(dirname: str, project: dict, projects: list, config: dict):
     """
     Ask the user to confirm, reject, or override a proposed match.
-    Returns the confirmed project dict, or None to skip.
+    Returns: confirmed project dict, None to skip, or GO_BACK sentinel.
     """
     print(f"  {dirname}  →  {project['name']}")
-    answer = input("    [y/n/project name]: ").strip()
+    answer = input("    [y/n/back/project name]: ").strip()
     if answer.lower() == "y" or answer == "":
         return project
     if answer.lower() == "n":
         return None
-    # Treat as a project name query
+    if answer.lower() in ("b", "back"):
+        return GO_BACK
+    return _resolve_or_create(answer, projects, config)
+
+
+def print_projects_by_client(projects: list):
+    """Print all Clockify projects grouped by client."""
+    by_client = {}
+    for p in projects:
+        client = p.get("clientName") or "No client"
+        by_client.setdefault(client, []).append(p["name"])
+    print("── Clockify projects ──────────────────────────")
+    for client in sorted(by_client):
+        print(f"  {client}")
+        for name in sorted(by_client[client]):
+            print(f"    • {name}")
+    print("───────────────────────────────────────────────\n")
+
+
+def _resolve_or_create(answer: str, projects: list, config: dict) -> dict | None:
+    """
+    Try to fuzzy-match answer against existing projects.
+    If no match found, offer to create a new Clockify project with that name.
+    Returns the project dict or None.
+    """
     found = fuzzy_find_project(answer, projects)
     if found:
         print(f"    Using: {found['name']}")
         return found
-    print(f"    No project matched '{answer}' — skipping.")
+    create = input(f"    No match for '{answer}'. Create new Clockify project? [y/n]: ").strip().lower()
+    if create == "y":
+        try:
+            new_project = create_clockify_project(config, answer)
+            projects.append(new_project)   # make it available for subsequent matches
+            print(f"    Created: '{new_project['name']}'  ({new_project['id']})")
+            log.info(f"Created new Clockify project '{new_project['name']}' ({new_project['id']})")
+            return new_project
+        except Exception as e:
+            print(f"    ERROR creating project: {e}")
+            return None
     return None
 
 
@@ -317,6 +364,7 @@ def cmd_match(days: int, dry_run: bool, interactive: bool):
         print(f"ERROR: Could not fetch Clockify projects: {e}")
         sys.exit(1)
 
+    print_projects_by_client(projects)
     print(f"Asking Claude to match against {len(projects)} project(s)...\n")
     try:
         matches = match_with_claude(anthropic_key, unmatched, projects)
@@ -329,38 +377,50 @@ def cmd_match(days: int, dry_run: bool, interactive: bool):
     null_count = 0
 
     if interactive:
-        print("Review each proposed match  (y = accept, n = skip, or type a project name):\n")
+        print("Review each proposed match  (y = accept, n = skip, back = redo previous, or type a project name):\n")
+        i = 0
+        while i < len(unmatched):
+            dirname = unmatched[i]
+            project_id = matches.get(dirname)
 
-    for dirname in unmatched:
-        project_id = matches.get(dirname)
-        if project_id and project_id in project_by_id:
-            project = project_by_id[project_id]
-            if interactive:
-                confirmed = confirm_match(dirname, project, projects)
-                if confirmed:
-                    to_save[dirname] = confirmed["id"]
-                    log.info(f"Matched '{dirname}' → {confirmed['name']} (interactive)")
-                else:
-                    null_count += 1
+            if project_id and project_id in project_by_id:
+                result = confirm_match(dirname, project_by_id[project_id], projects, config)
             else:
-                to_save[dirname] = project_id
-                print(f"  {dirname}  →  {project['name']}")
-                log.info(f"Matched '{dirname}' → {project['name']}")
-        else:
-            if interactive:
                 print(f"  {dirname}  →  (no confident match)")
-                answer = input("    Type a project name to assign, or press Enter to skip: ").strip()
-                if answer:
-                    found = fuzzy_find_project(answer, projects)
-                    if found:
-                        to_save[dirname] = found["id"]
-                        print(f"    Using: {found['name']}")
-                        log.info(f"Manually mapped '{dirname}' → {found['name']}")
-                    else:
-                        print(f"    No project matched '{answer}' — skipping.")
-                        null_count += 1
+                answer = input("    [back/project name/Enter to skip]: ").strip()
+                if answer.lower() in ("b", "back"):
+                    result = GO_BACK
+                elif answer:
+                    result = _resolve_or_create(answer, projects, config)
                 else:
-                    null_count += 1
+                    result = None
+
+            if result is GO_BACK:
+                if i > 0:
+                    prev = unmatched[i - 1]
+                    to_save.pop(prev, None)   # undo previous save decision
+                    print(f"  (going back to '{prev}')\n")
+                    i -= 1
+                else:
+                    print("  (already at the first item)")
+                continue
+
+            if result:
+                to_save[dirname] = result["id"]
+                log.info(f"Matched '{dirname}' → {result['name']} (interactive)")
+            else:
+                to_save.pop(dirname, None)   # clear if re-answering
+
+            i += 1
+
+        null_count = sum(1 for d in unmatched if d not in to_save)
+    else:
+        for dirname in unmatched:
+            project_id = matches.get(dirname)
+            if project_id and project_id in project_by_id:
+                to_save[dirname] = project_id
+                print(f"  {dirname}  →  {project_by_id[project_id]['name']}")
+                log.info(f"Matched '{dirname}' → {project_by_id[project_id]['name']}")
             else:
                 print(f"  {dirname}  →  (no confident match — will retry next run)")
                 null_count += 1
