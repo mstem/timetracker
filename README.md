@@ -1,4 +1,4 @@
-# Terminal Time Tracker
+# Timetracker
 
 Vibecoding and jumping between 12 different terminal windows kind of obliterates traditional time tracking across projects. This little script hopes to return a little bit of automated-tracking sanity to your logs so you can get a sense of roughly where your time went when the hours pass.
 
@@ -26,8 +26,8 @@ Automatically tracks time spent in Terminal.app windows and syncs daily totals t
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/terminal-time-tracker.git
-cd terminal-time-tracker
+git clone https://github.com/YOUR_USERNAME/timetracker.git
+cd timetracker
 ```
 
 ### 2. Create your config
@@ -109,9 +109,8 @@ Mappings are saved in `project_mappings.json` (gitignored — stays local).
    ```json
    { "anthropic_api_key": "sk-ant-..." }
    ```
-3. Re-run `setup.sh` — it installs two launchd agents:
+3. Re-run `setup.sh` — it installs a launchd agent:
    - **Monday 9am**: auto-runs `ai_matcher.py` to save high-confidence matches
-   - **Friday 4pm**: fires a macOS notification reminding you to do the interactive review
 
 ### Manual usage
 
@@ -155,6 +154,34 @@ python3 ai_matcher.py --link my-project-dir "My Project Name"
 - Confirmed matches are written to `project_mappings.json`
 - Dirnames where Claude returns no match remain unmatched and are retried on the next run
 
+## Watchdogs (optional)
+
+Since the tracker runs silently in the background, it's easy to not notice if it stops working. Two launchd agents alert you via a Telegram bot when something's wrong:
+
+- **`watchdog_process.sh`** (every 10 min): checks whether the `com.terminaltracker` launchd job is actually running; alerts if it crashed or got unloaded.
+- **`watchdog_health.sh`** (hourly, 9am-8pm): checks that today's log file has been written to recently. Catches the case where the process is alive but silently stuck (e.g. it lost AppleScript/Accessibility permission) — something a simple "is it running" check would miss.
+
+### Setup
+
+1. Create a Telegram bot via [@BotFather](https://t.me/BotFather) (`/newbot`) and note the token it gives you
+2. Send your bot any message, then visit `https://api.telegram.org/bot<TOKEN>/getUpdates` to find your `chat_id`
+3. Add both to `config.json`:
+   ```json
+   { "telegram_bot_token": "123456:ABC...", "telegram_chat_id": "123456789" }
+   ```
+4. Re-run `setup.sh` — it installs both watchdog agents
+
+### Manual usage
+
+```bash
+# Send a test message
+./notify_telegram.sh "test message"
+
+# Run a watchdog check manually
+./watchdog_process.sh
+./watchdog_health.sh
+```
+
 ## Claude Code hook (optional)
 
 `check_clockify_mapping.py` is a Claude Code `UserPromptSubmit` hook. When you open a project in Claude Code that has no Clockify mapping yet, it prompts Claude to ask you which project to associate before proceeding.
@@ -170,7 +197,7 @@ To enable it, add to your Claude Code settings (`~/.claude/settings.json`):
         "hooks": [
           {
             "type": "command",
-            "command": "python3 /path/to/terminal-time-tracker/check_clockify_mapping.py"
+            "command": "python3 /path/to/timetracker/check_clockify_mapping.py"
           }
         ]
       }
@@ -182,10 +209,13 @@ To enable it, add to your Claude Code settings (`~/.claude/settings.json`):
 ## File layout
 
 ```
-terminal-time-tracker/
+timetracker/
 ├── tracker.py                 # main daemon
 ├── check_clockify_mapping.py  # optional Claude Code hook
-├── setup.sh                   # installs the launchd agent
+├── notify_telegram.sh         # shared Telegram-send helper
+├── watchdog_process.sh        # alerts if the tracker daemon isn't running
+├── watchdog_health.sh         # alerts if today's log has gone stale
+├── setup.sh                   # installs the launchd agents
 ├── config.example.json        # template — copy to config.json and fill in
 └── logs/                      # daily JSON logs (auto-created, gitignored)
 ```

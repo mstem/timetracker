@@ -31,7 +31,10 @@ LOGS_DIR = os.path.join(BASE_DIR, "logs")
 SENT_FILE = os.path.join(BASE_DIR, "sent_dates.json")
 LOG_FILE = os.path.join(BASE_DIR, "tracker.log")
 POLL_INTERVAL = 2  # seconds
-MIN_ENTRY_SECONDS = 5  # skip entries shorter than this when sending
+MIN_ENTRY_SECONDS = 5     # skip entries shorter than this when sending
+MAX_ENTRY_SECONDS = 3600  # skip entries longer than this (erroneous)
+CHROME_MIN_SECONDS = 300      # min continuous focus before logging a Chrome tab
+CLOCKIFY_CHECK_INTERVAL = 60  # seconds between Clockify active-timer API checks
 
 logging.basicConfig(
     filename=LOG_FILE,
@@ -73,6 +76,16 @@ tell application "Terminal"
 end tell
 '''
 
+CHROME_APPLESCRIPT = '''
+tell application "Google Chrome"
+    if frontmost then
+        return title of active tab of front window
+    else
+        return ""
+    end if
+end tell
+'''
+
 def get_active_window():
     """Return active Terminal.app window name, or None if Terminal isn't focused."""
     try:
@@ -84,6 +97,20 @@ def get_active_window():
         return name if name else None
     except Exception as e:
         log.debug(f"osascript error: {e}")
+        return None
+
+
+def get_active_chrome_tab():
+    """Return active Chrome tab title prefixed with [Chrome], or None if Chrome isn't focused."""
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", CHROME_APPLESCRIPT],
+            capture_output=True, text=True, timeout=3
+        )
+        name = result.stdout.strip()
+        return f"[Chrome] {name}" if name else None
+    except Exception as e:
+        log.debug(f"osascript chrome error: {e}")
         return None
 
 
@@ -102,9 +129,9 @@ def load_entries(path: str) -> list:
     return []
 
 
-def append_entry(path: str, window: str, start: datetime.datetime, end: datetime.datetime):
+def append_entry(path: str, window: str, start: datetime.datetime, end: datetime.datetime, min_duration: int = 1):
     duration = int((end - start).total_seconds())
-    if duration < 1:
+    if duration < min_duration:
         return
     entries = load_entries(path)
     entries.append({
@@ -194,12 +221,16 @@ def clockify_request(method: str, path: str, api_key: str, body: dict = None):
 
 def send_to_clockify(config: dict, date_str: str, entries: list) -> int:
     """Send aggregated daily entries to Clockify. Returns number of entries sent."""
+    entries = [e for e in entries if e["seconds"] <= MAX_ENTRY_SECONDS]
     groups = aggregate_entries(entries)
     mappings = load_project_mappings()
     sent = 0
     for window, data in groups.items():
         if data["seconds"] < MIN_ENTRY_SECONDS:
             log.info(f"Skipping '{window}' ({data['seconds']}s, under minimum)")
+            continue
+        if data["seconds"] > MAX_ENTRY_SECONDS:
+            log.info(f"Skipping '{window}' ({data['seconds']}s, over maximum)")
             continue
 
         start_dt = datetime.datetime.strptime(data["start"], "%Y-%m-%dT%H:%M:%SZ")
@@ -291,6 +322,14 @@ class Tracker:
         self.current_date = datetime.date.today()
         self.sent_dates = load_sent_dates()
 
+        self.current_chrome_tab: str | None = None
+        self.chrome_tab_start: datetime.datetime | None = None
+        self._clockify_active_cache: bool = False
+        self._clockify_last_check: datetime.datetime = (
+            datetime.datetime.utcnow() - datetime.timedelta(seconds=CLOCKIFY_CHECK_INTERVAL)
+        )
+        self._user_id: str | None = None
+
         signal.signal(signal.SIGTERM, self._on_shutdown)
         signal.signal(signal.SIGINT, self._on_shutdown)
 
@@ -301,6 +340,50 @@ class Tracker:
             append_entry(path, self.current_window, self.window_start, now)
         self.current_window = None
         self.window_start = None
+
+    def _flush_chrome(self, now: datetime.datetime):
+        """Write the active Chrome tab's elapsed time only if it met the minimum focus duration."""
+        if self.current_chrome_tab and self.chrome_tab_start:
+            path = log_path_for(self.current_date)
+            append_entry(path, self.current_chrome_tab, self.chrome_tab_start, now,
+                         min_duration=CHROME_MIN_SECONDS)
+        self.current_chrome_tab = None
+        self.chrome_tab_start = None
+
+    def _discard_current(self):
+        """Discard the current terminal session without logging it."""
+        self.current_window = None
+        self.window_start = None
+
+    def _discard_chrome(self):
+        """Discard the current Chrome tab session without logging it."""
+        self.current_chrome_tab = None
+        self.chrome_tab_start = None
+
+    def _get_user_id(self) -> str:
+        if not self._user_id:
+            user = clockify_request("GET", "/user", self.config["api_key"])
+            self._user_id = user["id"]
+        return self._user_id
+
+    def _has_clockify_active_timer(self) -> bool:
+        """Return True if Clockify has a running timer. Result is cached for CLOCKIFY_CHECK_INTERVAL seconds."""
+        now = datetime.datetime.utcnow()
+        if (now - self._clockify_last_check).total_seconds() < CLOCKIFY_CHECK_INTERVAL:
+            return self._clockify_active_cache
+        try:
+            uid = self._get_user_id()
+            entries = clockify_request(
+                "GET",
+                f"/workspaces/{self.config['workspace_id']}/user/{uid}/time-entries?in-progress=true&page-size=1",
+                self.config["api_key"],
+            )
+            self._clockify_active_cache = bool(entries)
+        except Exception as e:
+            log.debug(f"Clockify active-timer check failed: {e}")
+            self._clockify_active_cache = False
+        self._clockify_last_check = now
+        return self._clockify_active_cache
 
     def _check_midnight(self):
         today = datetime.date.today()
@@ -323,7 +406,9 @@ class Tracker:
 
     def _on_shutdown(self, signum, frame):
         log.info("Shutdown signal received — flushing current window.")
-        self._flush_current(datetime.datetime.utcnow())
+        now = datetime.datetime.utcnow()
+        self._flush_current(now)
+        self._flush_chrome(now)
         sys.exit(0)
 
     def run(self):
@@ -335,13 +420,35 @@ class Tracker:
             now = datetime.datetime.utcnow()
             self._check_midnight()
             active = get_active_window()
+            timer_running = self._has_clockify_active_timer()
 
-            if active != self.current_window:
-                self._flush_current(now)
-                if active:
-                    self.current_window = active
-                    self.window_start = now
-                    log.debug(f"Window focus: '{active}'")
+            if timer_running:
+                # A Clockify timer is active — discard any in-progress tracking
+                if self.current_window:
+                    self._discard_current()
+                if self.current_chrome_tab:
+                    self._discard_chrome()
+            else:
+                # Terminal tracking
+                if active != self.current_window:
+                    self._flush_current(now)
+                    if active:
+                        self.current_window = active
+                        self.window_start = now
+                        log.debug(f"Window focus: '{active}'")
+
+                # Chrome tracking: only when Terminal is not focused
+                if not active:
+                    chrome_active = get_active_chrome_tab()
+                    if chrome_active != self.current_chrome_tab:
+                        self._flush_chrome(now)
+                        if chrome_active:
+                            self.current_chrome_tab = chrome_active
+                            self.chrome_tab_start = now
+                            log.debug(f"Chrome tab focus: '{chrome_active}'")
+                elif self.current_chrome_tab:
+                    # Terminal took focus — flush any in-progress Chrome session
+                    self._flush_chrome(now)
 
             time.sleep(POLL_INTERVAL)
 
