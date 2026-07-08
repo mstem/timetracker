@@ -94,7 +94,7 @@ def get_frontmost():
             ["osascript", "-e", SYSTEM_EVENTS_SCRIPT],
             capture_output=True, text=True, timeout=3
         )
-        raw = result.stdout.strip()
+        raw = result.stdout.rstrip("\r\n")
         if "\x1f" not in raw:
             return None
         app_name, window_title = raw.split("\x1f", 1)
