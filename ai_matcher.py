@@ -1,233 +1,164 @@
 #!/usr/bin/env python3
 """
-AI-powered bulk project matcher for the terminal time tracker.
-Scans recent log files, finds directory names with no Clockify mapping,
-and uses Claude to match them against your Clockify projects in one batch call.
+AI-powered project classifier for the activity tracker.
+Scans recent log files, finds activity keys (Terminal directory names,
+Chrome tab domains, or other app names) with no Clockify mapping, and uses
+Claude to match them against your Clockify projects in one batch call.
 Matched results are saved to project_mappings.json and never re-queried.
 
+`classify_and_save()` is also called automatically by tracker.py right
+before every send, so new activity gets classified without any manual step.
+This CLI remains for manual review, dry runs, and corrections.
+
 Usage:
-  python3 ai_matcher.py                        # match unmatched dirnames (last 7 days)
+  python3 ai_matcher.py                        # match unmapped keys (last 7 days)
   python3 ai_matcher.py --dry-run              # preview matches without saving
-  python3 ai_matcher.py --days N               # look back N days (default 7)
+  python3 ai_matcher.py --days N                # look back N days (default 7)
   python3 ai_matcher.py --interactive          # propose each match, you confirm
-  python3 ai_matcher.py --link DIR "Name"      # fuzzy-link a dirname to a project by name
+  python3 ai_matcher.py --link KEY "Name"      # fuzzy-link an activity key to a project by name
 """
 
 import json
 import os
 import sys
 import datetime
-import urllib.request
-import urllib.error
 import logging
 
-BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH   = os.path.join(BASE_DIR, "config.json")
-MAPPINGS_PATH = os.path.join(BASE_DIR, "project_mappings.json")
-LOGS_DIR      = os.path.join(BASE_DIR, "logs")
-LOG_FILE      = os.path.join(BASE_DIR, "ai_matcher.log")
+import common
 
-CLAUDE_API_URL    = "https://api.anthropic.com/v1/messages"
-CLAUDE_MODEL      = "claude-haiku-4-5-20251001"
-ANTHROPIC_VERSION = "2023-06-01"
-DEFAULT_DAYS      = 7
+LOG_FILE = os.path.join(common.BASE_DIR, "ai_matcher.log")
 
-# Directory names that are shell/OS artifacts, not project directories
-SKIP_DIRNAMES = {"Terminal", "home", "~", "Desktop", "Downloads", "Documents"}
+DEFAULT_DAYS = 7
+SAMPLE_TITLES_PER_KEY = 5
 
 # Sentinel returned from interactive prompts to signal "go back to previous item"
 GO_BACK = object()
 
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
 log = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-def load_config() -> dict:
-    if not os.path.exists(CONFIG_PATH):
-        print(f"ERROR: config.json not found at {CONFIG_PATH}")
-        print("Run setup.sh first and fill in your API key and workspace ID.")
-        sys.exit(1)
-    with open(CONFIG_PATH) as f:
-        return json.load(f)
-
-
-def require_anthropic_key(config: dict) -> str:
-    key = config.get("anthropic_api_key", "")
-    if not key or key.startswith("<"):
-        print("anthropic_api_key not set in config.json — AI matching is opt-in.")
-        print("Add your Anthropic API key to config.json to enable this feature.")
-        sys.exit(0)
-    return key
-
-
-# ---------------------------------------------------------------------------
-# Project mappings  (shared format with tracker.py)
-# ---------------------------------------------------------------------------
-
-def load_project_mappings() -> dict:
-    if os.path.exists(MAPPINGS_PATH):
-        with open(MAPPINGS_PATH) as f:
-            return json.load(f)
-    return {}
-
-
-def save_project_mappings(mappings: dict):
-    """Write atomically to avoid corruption if tracker daemon is running."""
-    tmp = MAPPINGS_PATH + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(mappings, f, indent=2)
-    os.replace(tmp, MAPPINGS_PATH)
-
-
-# ---------------------------------------------------------------------------
-# Window title parsing  (mirrors tracker.py)
-# ---------------------------------------------------------------------------
-
-def window_dir(window_name: str) -> str:
-    """Extract the leading directory segment from a Terminal window title."""
-    return window_name.split(" — ")[0].strip()
-
-
-def is_noise(dirname: str) -> bool:
-    if not dirname or len(dirname) <= 1:
-        return True
-    if dirname in SKIP_DIRNAMES:
-        return True
-    if dirname.startswith("-"):   # shell artifacts like "-zsh"
-        return True
-    if dirname.startswith(".") and len(dirname) == 1:
-        return True
-    return False
 
 
 # ---------------------------------------------------------------------------
 # Log scanning
 # ---------------------------------------------------------------------------
 
-def collect_unmatched_dirnames(days: int, mappings: dict) -> list:
+def collect_unmapped_keys_from_entries(entries: list, mappings: dict, config: dict) -> dict:
     """
-    Scan the last N days of log files, collect unique directory names
-    that have no mapping yet.
+    Scan a list of log entries, return {key: [sample raw titles]} for activity
+    keys with no existing mapping. Skips Terminal noise dirnames (shell
+    artifacts like "-zsh" or bare "~") and generic Chrome domains (sign-in
+    flows, bare search homepages — see common.is_generic_domain) — neither
+    carries real project signal, so neither is worth asking Claude about.
+    """
+    unmapped = {}
+    for e in entries:
+        key = common.entry_key(e)
+        if key in mappings:
+            continue
+        if key.startswith("chrome:"):
+            if common.is_generic_domain(key[len("chrome:"):], config):
+                continue
+        elif not key.startswith("app:") and common.is_noise_dirname(key):
+            continue
+        titles = unmapped.setdefault(key, [])
+        title = e.get("window", key)
+        if title not in titles and len(titles) < SAMPLE_TITLES_PER_KEY:
+            titles.append(title)
+    return unmapped
+
+
+def collect_unmapped_keys(days: int, mappings: dict, config: dict) -> dict:
+    """
+    Scan the last N days of log files, merge into one {key: [sample titles]}
+    dict of activity keys with no mapping yet.
     """
     today = datetime.date.today()
-    dirnames = set()
+    merged = {}
 
     for i in range(1, days + 1):          # never include today's partial log
         date = today - datetime.timedelta(days=i)
-        path = os.path.join(LOGS_DIR, f"{date.isoformat()}.json")
+        path = os.path.join(common.LOGS_DIR, f"{date.isoformat()}.json")
         if not os.path.exists(path):
             continue
         try:
             with open(path) as f:
                 entries = json.load(f)
-            for e in entries:
-                d = window_dir(e.get("window", ""))
-                if not is_noise(d):
-                    dirnames.add(d)
         except Exception as exc:
             log.warning(f"Could not read {path}: {exc}")
+            continue
+        for key, titles in collect_unmapped_keys_from_entries(entries, mappings, config).items():
+            existing = merged.setdefault(key, [])
+            for t in titles:
+                if t not in existing and len(existing) < SAMPLE_TITLES_PER_KEY:
+                    existing.append(t)
 
-    return sorted(d for d in dirnames if d not in mappings)
-
-
-# ---------------------------------------------------------------------------
-# Clockify
-# ---------------------------------------------------------------------------
-
-def clockify_request(method: str, path: str, api_key: str, body: dict = None):
-    url = f"https://api.clockify.me/api/v1{path}"
-    headers = {"X-Api-Key": api_key, "Content-Type": "application/json"}
-    data = json.dumps(body).encode() if body else None
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return json.loads(resp.read())
-
-
-def list_clockify_projects(config: dict) -> list:
-    return clockify_request(
-        "GET",
-        f"/workspaces/{config['workspace_id']}/projects?archived=false&page-size=500",
-        config["api_key"],
-    )
-
-
-def create_clockify_project(config: dict, name: str) -> dict:
-    """Create a new Clockify project and return it."""
-    return clockify_request(
-        "POST",
-        f"/workspaces/{config['workspace_id']}/projects",
-        config["api_key"],
-        {"name": name, "billable": False},
-    )
+    return merged
 
 
 # ---------------------------------------------------------------------------
 # Anthropic / Claude
 # ---------------------------------------------------------------------------
 
-def anthropic_request(api_key: str, messages: list, system: str) -> dict:
-    headers = {
-        "x-api-key": api_key,
-        "anthropic-version": ANTHROPIC_VERSION,
-        "content-type": "application/json",
-    }
-    body = json.dumps({
-        "model": CLAUDE_MODEL,
-        "max_tokens": 1024,
-        "system": system,
-        "messages": messages,
-    }).encode()
-    req = urllib.request.Request(CLAUDE_API_URL, data=body, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        err = e.read().decode()
-        raise RuntimeError(f"Anthropic API HTTP {e.code}: {err}") from e
-
-
-def match_with_claude(api_key: str, unmatched: list, projects: list) -> dict:
+def classify_keys_with_claude(api_key: str, unmapped: dict, projects: list, mappings: dict = None) -> dict:
     """
-    Send all unmatched dirnames + all project names to Claude in one call.
-    Returns {dirname: project_id_or_None}.
+    Send all unmapped activity keys (with sample titles for context) + all
+    project names to Claude in one call. Returns {key: project_id_or_None}.
+
+    `mappings` (existing confirmed key → project_id mappings, if any) are
+    included as calibration examples so Claude has a concrete sense of what
+    "specific enough to map" looks like in this user's own data, rather than
+    guessing from the project list alone.
     """
     project_map = {p["name"]: p["id"] for p in projects}
+    project_by_id = {p["id"]: p["name"] for p in projects}
+
+    examples_block = ""
+    if mappings:
+        sample = {k: project_by_id[v] for k, v in list(mappings.items())[:15] if v in project_by_id}
+        if sample:
+            examples_block = (
+                "\nExamples of activity keys this user has already confirmed map to a "
+                f"specific project (for calibration only — do not reuse these keys):\n"
+                f"{json.dumps(sample, indent=2)}\n"
+            )
 
     system = (
-        "You are a project-matching assistant for a terminal time tracker. "
-        "Map Unix directory names from macOS Terminal window titles to Clockify project IDs. "
+        "You are a project-matching assistant for a personal time tracker. "
+        "Map activity keys to Clockify project IDs. Activity keys come in three "
+        "forms: a bare directory name (from a macOS Terminal window title), "
+        "'chrome:<domain>' (a Chrome tab's domain), or 'app:<AppName>' (any other "
+        "application's name). Use the sample window/tab titles given for each key "
+        "as context for what the user was actually doing. "
         "Reply ONLY with valid JSON. No markdown, no explanation, no code fences."
     )
 
     user = (
-        "Match each directory name to the most appropriate Clockify project.\n\n"
-        f"Directory names to match:\n{json.dumps(unmatched)}\n\n"
+        "Match each activity key to the most appropriate Clockify project.\n"
+        f"{examples_block}\n"
+        f"Activity keys to match, with sample titles seen for each:\n{json.dumps(unmapped, indent=2)}\n\n"
         f"Available Clockify projects (name → id):\n{json.dumps(project_map, indent=2)}\n\n"
         "Rules:\n"
-        "- Return the project ID string if there is a clear, confident match.\n"
-        "- Return null if there is no good match. Prefer null over a weak guess.\n"
-        "- Every directory name in the input must appear as a key in your response.\n\n"
-        f"Respond with exactly this JSON structure:\n"
-        '{{"dirname1": "id_or_null", "dirname2": "id_or_null", ...}}'
+        "- Only return a project ID when the sample titles reference something "
+        "specific — a named project, client, document, or task — that clearly "
+        "belongs to one project.\n"
+        "- Return null for anything that is just a generic product surface with no "
+        "project-specific content: sign-in/login/auth screens, a bare search engine "
+        "homepage, an empty inbox or calendar view, a generic app launch screen, or "
+        "any title too vague to distinguish between projects. Being on a domain "
+        "like docs.google.com or calendar.google.com is NOT itself a signal — the "
+        "title still has to name something specific (e.g. \"Q3 Marketing Plan - "
+        "Google Docs\" is specific; \"Google Calendar\" or \"Sign in - Google "
+        "accounts\" is not).\n"
+        "- Prefer null over a weak guess, even if some project seems plausible.\n"
+        "- Every activity key in the input must appear as a key in your response.\n\n"
+        "Respond with exactly this JSON structure:\n"
+        '{"key1": "id_or_null", "key2": "id_or_null", ...}'
     )
 
-    response = anthropic_request(api_key, [{"role": "user", "content": user}], system)
+    response = common.anthropic_request(api_key, [{"role": "user", "content": user}], system)
 
     raw = response["content"][0]["text"].strip()
     log.info(f"Claude raw response: {raw}")
-
-    # Strip markdown code fences if present (e.g. ```json ... ```)
-    if raw.startswith("```"):
-        raw = raw.split("\n", 1)[-1]          # drop opening fence line
-        raw = raw.rsplit("```", 1)[0].strip()  # drop closing fence
+    raw = common.strip_markdown_fences(raw)
 
     try:
         result = json.loads(raw)
@@ -240,23 +171,55 @@ def match_with_claude(api_key: str, unmatched: list, projects: list) -> dict:
     # Validate: returned IDs must exist in the project list
     valid_ids = {p["id"] for p in projects}
     validated = {}
-    for dirname, project_id in result.items():
+    for key, project_id in result.items():
         if project_id is None:
-            validated[dirname] = None
+            validated[key] = None
         elif project_id in valid_ids:
-            validated[dirname] = project_id
+            validated[key] = project_id
         else:
-            log.warning(f"Claude returned unknown project ID '{project_id}' for '{dirname}' — skipping")
-            validated[dirname] = None
+            log.warning(f"Claude returned unknown project ID '{project_id}' for '{key}' — skipping")
+            validated[key] = None
 
     return validated
+
+
+def classify_and_save(config: dict, entries: list) -> dict:
+    """
+    Importable entrypoint used by tracker.py right before sending: find
+    activity keys in `entries` with no existing mapping, batch-classify them,
+    save confident matches, and return the (possibly updated) mappings dict.
+    Never raises — a classification failure should never block a send whose
+    entries already have mappings.
+    """
+    mappings = common.load_project_mappings()
+
+    anthropic_key = common.require_anthropic_key(config)
+    if not anthropic_key:
+        return mappings
+
+    unmapped = collect_unmapped_keys_from_entries(entries, mappings, config)
+    if not unmapped:
+        return mappings
+
+    try:
+        projects = common.list_clockify_projects(config)
+        matches = classify_keys_with_claude(anthropic_key, unmapped, projects, mappings)
+        to_save = {key: pid for key, pid in matches.items() if pid}
+        if to_save:
+            mappings.update(to_save)
+            common.save_project_mappings(mappings)
+            log.info(f"Auto-classified {len(to_save)} activity key(s) before send: {to_save}")
+    except Exception as e:
+        log.error(f"Classification before send failed (continuing without it): {e}")
+
+    return mappings
 
 
 # ---------------------------------------------------------------------------
 # Fuzzy project finder  (for --link, no AI needed)
 # ---------------------------------------------------------------------------
 
-def fuzzy_find_project(name_query: str, projects: list) -> dict | None:
+def fuzzy_find_project(name_query: str, projects: list):
     query_lower = name_query.lower()
     query_words = set(query_lower.split())
     best = None
@@ -284,12 +247,12 @@ def fuzzy_find_project(name_query: str, projects: list) -> dict | None:
 # Interactive confirmation
 # ---------------------------------------------------------------------------
 
-def confirm_match(dirname: str, project: dict, projects: list, config: dict):
+def confirm_match(key: str, project: dict, projects: list, config: dict):
     """
     Ask the user to confirm, reject, or override a proposed match.
     Returns: confirmed project dict, None to skip, or GO_BACK sentinel.
     """
-    print(f"  {dirname}  →  {project['name']}")
+    print(f"  {key}  →  {project['name']}")
     answer = input("    [y/n/back/project name]: ").strip()
     if answer.lower() == "y" or answer == "":
         return project
@@ -313,7 +276,7 @@ def print_projects_by_client(projects: list):
     print("───────────────────────────────────────────────\n")
 
 
-def _resolve_or_create(answer: str, projects: list, config: dict) -> dict | None:
+def _resolve_or_create(answer: str, projects: list, config: dict):
     """
     Try to fuzzy-match answer against existing projects.
     If no match found, offer to create a new Clockify project with that name.
@@ -326,7 +289,7 @@ def _resolve_or_create(answer: str, projects: list, config: dict) -> dict | None
     create = input(f"    No match for '{answer}'. Create new Clockify project? [y/n]: ").strip().lower()
     if create == "y":
         try:
-            new_project = create_clockify_project(config, answer)
+            new_project = common.create_clockify_project(config, answer)
             projects.append(new_project)   # make it available for subsequent matches
             print(f"    Created: '{new_project['name']}'  ({new_project['id']})")
             log.info(f"Created new Clockify project '{new_project['name']}' ({new_project['id']})")
@@ -342,23 +305,27 @@ def _resolve_or_create(answer: str, projects: list, config: dict) -> dict | None
 # ---------------------------------------------------------------------------
 
 def cmd_match(days: int, dry_run: bool, interactive: bool):
-    config = load_config()
-    anthropic_key = require_anthropic_key(config)
-
-    mappings = load_project_mappings()
-
-    print(f"Scanning logs from the last {days} days...")
-    unmatched = collect_unmatched_dirnames(days, mappings)
-
-    if not unmatched:
-        print("All dirnames already mapped — nothing to do.")
+    config = common.load_config()
+    anthropic_key = common.require_anthropic_key(config)
+    if not anthropic_key:
+        print("anthropic_api_key not set in config.json — AI matching is opt-in.")
+        print("Add your Anthropic API key to config.json to enable this feature.")
         return
 
-    print(f"Found {len(unmatched)} unmatched dirname(s): {', '.join(unmatched)}\n")
+    mappings = common.load_project_mappings()
+
+    print(f"Scanning logs from the last {days} days...")
+    unmapped = collect_unmapped_keys(days, mappings, config)
+
+    if not unmapped:
+        print("All activity keys already mapped — nothing to do.")
+        return
+
+    print(f"Found {len(unmapped)} unmapped activity key(s): {', '.join(unmapped)}\n")
 
     print("Fetching Clockify projects...")
     try:
-        projects = list_clockify_projects(config)
+        projects = common.list_clockify_projects(config)
     except Exception as e:
         print(f"ERROR: Could not fetch Clockify projects: {e}")
         sys.exit(1)
@@ -366,26 +333,27 @@ def cmd_match(days: int, dry_run: bool, interactive: bool):
     print_projects_by_client(projects)
     print(f"Asking Claude to match against {len(projects)} project(s)...\n")
     try:
-        matches = match_with_claude(anthropic_key, unmatched, projects)
+        matches = classify_keys_with_claude(anthropic_key, unmapped, projects, mappings)
     except RuntimeError as e:
         print(f"ERROR: {e}")
         sys.exit(1)
 
     project_by_id = {p["id"]: p for p in projects}
+    keys = list(unmapped.keys())
     to_save = {}
     null_count = 0
 
     if interactive:
         print("Review each proposed match  (y = accept, n = skip, back = redo previous, or type a project name):\n")
         i = 0
-        while i < len(unmatched):
-            dirname = unmatched[i]
-            project_id = matches.get(dirname)
+        while i < len(keys):
+            key = keys[i]
+            project_id = matches.get(key)
 
             if project_id and project_id in project_by_id:
-                result = confirm_match(dirname, project_by_id[project_id], projects, config)
+                result = confirm_match(key, project_by_id[project_id], projects, config)
             else:
-                print(f"  {dirname}  →  (no confident match)")
+                print(f"  {key}  →  (no confident match)")
                 answer = input("    [back/project name/Enter to skip]: ").strip()
                 if answer.lower() in ("b", "back"):
                     result = GO_BACK
@@ -396,7 +364,7 @@ def cmd_match(days: int, dry_run: bool, interactive: bool):
 
             if result is GO_BACK:
                 if i > 0:
-                    prev = unmatched[i - 1]
+                    prev = keys[i - 1]
                     to_save.pop(prev, None)   # undo previous save decision
                     print(f"  (going back to '{prev}')\n")
                     i -= 1
@@ -405,23 +373,23 @@ def cmd_match(days: int, dry_run: bool, interactive: bool):
                 continue
 
             if result:
-                to_save[dirname] = result["id"]
-                log.info(f"Matched '{dirname}' → {result['name']} (interactive)")
+                to_save[key] = result["id"]
+                log.info(f"Matched '{key}' → {result['name']} (interactive)")
             else:
-                to_save.pop(dirname, None)   # clear if re-answering
+                to_save.pop(key, None)   # clear if re-answering
 
             i += 1
 
-        null_count = sum(1 for d in unmatched if d not in to_save)
+        null_count = sum(1 for k in keys if k not in to_save)
     else:
-        for dirname in unmatched:
-            project_id = matches.get(dirname)
+        for key in keys:
+            project_id = matches.get(key)
             if project_id and project_id in project_by_id:
-                to_save[dirname] = project_id
-                print(f"  {dirname}  →  {project_by_id[project_id]['name']}")
-                log.info(f"Matched '{dirname}' → {project_by_id[project_id]['name']}")
+                to_save[key] = project_id
+                print(f"  {key}  →  {project_by_id[project_id]['name']}")
+                log.info(f"Matched '{key}' → {project_by_id[project_id]['name']}")
             else:
-                print(f"  {dirname}  →  (no confident match — will retry next run)")
+                print(f"  {key}  →  (no confident match — will retry next run)")
                 null_count += 1
 
     print()
@@ -430,21 +398,21 @@ def cmd_match(days: int, dry_run: bool, interactive: bool):
     else:
         if to_save:
             mappings.update(to_save)
-            save_project_mappings(mappings)
+            common.save_project_mappings(mappings)
             print(f"Saved {len(to_save)} match(es) to project_mappings.json.")
         if null_count:
-            print(f"{null_count} dirname(s) left unmatched — will retry on next run.")
+            print(f"{null_count} activity key(s) left unmapped — will retry on next run.")
         if not to_save and not null_count:
             print("Nothing to save.")
 
 
-def cmd_link(dirname: str, project_name_query: str):
-    """Fuzzy-link a dirname to a project by name. No Anthropic key needed."""
-    config = load_config()
+def cmd_link(key: str, project_name_query: str):
+    """Fuzzy-link an activity key to a project by name. No Anthropic key needed."""
+    config = common.load_config()
 
-    print(f"Fetching Clockify projects...")
+    print("Fetching Clockify projects...")
     try:
-        projects = list_clockify_projects(config)
+        projects = common.list_clockify_projects(config)
     except Exception as e:
         print(f"ERROR: Could not fetch Clockify projects: {e}")
         sys.exit(1)
@@ -458,11 +426,11 @@ def cmd_link(dirname: str, project_name_query: str):
             print(f"  {p['name']}{client}")
         sys.exit(1)
 
-    mappings = load_project_mappings()
-    mappings[dirname] = found["id"]
-    save_project_mappings(mappings)
-    print(f"Mapped '{dirname}'  →  {found['name']}  ({found['id']})")
-    log.info(f"Linked '{dirname}' → {found['name']} via --link")
+    mappings = common.load_project_mappings()
+    mappings[key] = found["id"]
+    common.save_project_mappings(mappings)
+    print(f"Mapped '{key}'  →  {found['name']}  ({found['id']})")
+    log.info(f"Linked '{key}' → {found['name']} via --link")
 
 
 # ---------------------------------------------------------------------------
@@ -470,21 +438,27 @@ def cmd_link(dirname: str, project_name_query: str):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        filename=LOG_FILE,
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
     args = sys.argv[1:]
 
     if "--link" in args:
         idx = args.index("--link")
         try:
-            link_dirname = args[idx + 1]
-            link_query   = args[idx + 2]
+            link_key = args[idx + 1]
+            link_query = args[idx + 2]
         except IndexError:
-            print("Usage: python3 ai_matcher.py --link DIR \"Project Name\"")
+            print('Usage: python3 ai_matcher.py --link KEY "Project Name"')
             sys.exit(1)
-        cmd_link(link_dirname, link_query)
+        cmd_link(link_key, link_query)
     else:
-        dry_run     = "--dry-run" in args
+        dry_run = "--dry-run" in args
         interactive = "--interactive" in args
-        days        = DEFAULT_DAYS
+        days = DEFAULT_DAYS
         if "--days" in args:
             idx = args.index("--days")
             try:

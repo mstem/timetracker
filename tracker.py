@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """
-Terminal window time tracker.
-Polls Terminal.app every 2 seconds, logs time per window, and sends
-aggregated daily entries to Clockify at midnight (or on next start).
+Mac activity time tracker.
+Polls the frontmost app/window every 2 seconds — Terminal, Chrome tabs (with
+URL), or any other app via System Events — logs time per activity, and sends
+aggregated daily entries to Clockify at midnight (or on next start). Any
+newly-seen activity is classified into a Clockify project by Claude right
+before sending.
 
 Usage:
   python3 tracker.py                          # run as daemon
   python3 tracker.py --send-today             # manually send today's log
   python3 tracker.py --send DATE              # manually send a specific date (YYYY-MM-DD)
   python3 tracker.py --list-projects          # list all Clockify projects
-  python3 tracker.py --map DIR PROJECT_ID     # map a project dir to a Clockify project ID
+  python3 tracker.py --map KEY PROJECT_ID     # map an activity key to a Clockify project ID
 """
+
+from __future__ import annotations
 
 import subprocess
 import json
@@ -18,22 +23,21 @@ import os
 import sys
 import time
 import datetime
-import urllib.request
 import urllib.error
 import signal
 import logging
 from collections import defaultdict
+from dataclasses import dataclass
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
-MAPPINGS_PATH = os.path.join(BASE_DIR, "project_mappings.json")
-LOGS_DIR = os.path.join(BASE_DIR, "logs")
+import common
+import ai_matcher
+
+BASE_DIR = common.BASE_DIR
+LOGS_DIR = common.LOGS_DIR
 SENT_FILE = os.path.join(BASE_DIR, "sent_dates.json")
 LOG_FILE = os.path.join(BASE_DIR, "tracker.log")
 POLL_INTERVAL = 2  # seconds
-MIN_ENTRY_SECONDS = 5     # skip entries shorter than this when sending
-MAX_ENTRY_SECONDS = 3600  # skip entries longer than this (erroneous)
-CHROME_MIN_SECONDS = 300      # min continuous focus before logging a Chrome tab
+MIN_ENTRY_SECONDS = 5  # hardcoded final floor when aggregating for send — not a tuning knob
 CLOCKIFY_CHECK_INTERVAL = 60  # seconds between Clockify active-timer API checks
 
 logging.basicConfig(
@@ -45,73 +49,100 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Config
+# Activity capture
 # ---------------------------------------------------------------------------
 
-def load_config():
-    if not os.path.exists(CONFIG_PATH):
-        print(f"ERROR: config.json not found at {CONFIG_PATH}")
-        print("Run setup.sh first and fill in your API key and workspace ID.")
-        sys.exit(1)
-    with open(CONFIG_PATH) as f:
-        cfg = json.load(f)
-    for key in ("api_key", "workspace_id"):
-        if not cfg.get(key) or cfg[key].startswith("<"):
-            print(f"ERROR: '{key}' not set in config.json")
-            sys.exit(1)
-    return cfg
-
-
-# ---------------------------------------------------------------------------
-# Terminal window detection
-# ---------------------------------------------------------------------------
-
-APPLESCRIPT = '''
-tell application "Terminal"
-    if frontmost then
-        return name of front window
-    else
-        return ""
-    end if
+SYSTEM_EVENTS_SCRIPT = '''
+tell application "System Events"
+    set frontApp to first application process whose frontmost is true
+    set appName to name of frontApp
+    try
+        set winName to name of front window of frontApp
+    on error
+        set winName to ""
+    end try
 end tell
+return appName & (ASCII character 31) & winName
 '''
 
-CHROME_APPLESCRIPT = '''
+CHROME_URL_SCRIPT = '''
 tell application "Google Chrome"
-    if frontmost then
-        return title of active tab of front window
+    if (count of windows) > 0 then
+        return URL of active tab of front window
     else
         return ""
     end if
 end tell
 '''
 
-def get_active_window():
-    """Return active Terminal.app window name, or None if Terminal isn't focused."""
+CHROME_TITLE_SUFFIX = " - Google Chrome"
+
+
+@dataclass
+class ActivityState:
+    source: str   # "terminal" | "chrome" | "app"
+    app: str
+    window: str
+    url: str | None
+    key: str
+
+
+def get_frontmost():
+    """Return (app_name, window_title) for whichever app is frontmost, or None."""
     try:
         result = subprocess.run(
-            ["osascript", "-e", APPLESCRIPT],
+            ["osascript", "-e", SYSTEM_EVENTS_SCRIPT],
             capture_output=True, text=True, timeout=3
         )
-        name = result.stdout.strip()
-        return name if name else None
+        raw = result.stdout.strip()
+        if "\x1f" not in raw:
+            return None
+        app_name, window_title = raw.split("\x1f", 1)
+        return (app_name, window_title) if app_name else None
     except Exception as e:
-        log.debug(f"osascript error: {e}")
+        log.debug(f"osascript system events error: {e}")
         return None
 
 
-def get_active_chrome_tab():
-    """Return active Chrome tab title prefixed with [Chrome], or None if Chrome isn't focused."""
+def get_chrome_url():
+    """Return the active Chrome tab's URL, or None."""
     try:
         result = subprocess.run(
-            ["osascript", "-e", CHROME_APPLESCRIPT],
+            ["osascript", "-e", CHROME_URL_SCRIPT],
             capture_output=True, text=True, timeout=3
         )
-        name = result.stdout.strip()
-        return f"[Chrome] {name}" if name else None
+        url = result.stdout.strip()
+        return url or None
     except Exception as e:
-        log.debug(f"osascript chrome error: {e}")
+        log.debug(f"osascript chrome url error: {e}")
         return None
+
+
+def classify_frontmost(config: dict):
+    """Return the current ActivityState, or None if nothing trackable is frontmost."""
+    fm = get_frontmost()
+    if fm is None:
+        return None
+    app_name, window_title = fm
+
+    if app_name == "Firefox":
+        return None  # out of scope for now
+
+    if app_name == "Terminal":
+        source, url = "terminal", None
+    elif app_name == "Google Chrome":
+        source = "chrome"
+        url = get_chrome_url()
+        if window_title.endswith(CHROME_TITLE_SUFFIX):
+            window_title = window_title[: -len(CHROME_TITLE_SUFFIX)]
+    else:
+        source, url = "app", None
+
+    if common.is_blocked(source, app_name, url, config):
+        return None
+
+    key = common.activity_key(source, window_title, url=url, app=app_name)
+    return ActivityState(source=source, app=app_name, window=window_title, url=url, key=key)
 
 
 # ---------------------------------------------------------------------------
@@ -129,13 +160,18 @@ def load_entries(path: str) -> list:
     return []
 
 
-def append_entry(path: str, window: str, start: datetime.datetime, end: datetime.datetime, min_duration: int = 1):
+def append_activity(path: str, activity: ActivityState, start: datetime.datetime,
+                     end: datetime.datetime, min_duration: int):
     duration = int((end - start).total_seconds())
     if duration < min_duration:
         return
     entries = load_entries(path)
     entries.append({
-        "window": window,
+        "source": activity.source,
+        "app": activity.app,
+        "window": activity.window,
+        "url": activity.url,
+        "key": activity.key,
         "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "end": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "seconds": duration,
@@ -145,50 +181,20 @@ def append_entry(path: str, window: str, start: datetime.datetime, end: datetime
 
 
 # ---------------------------------------------------------------------------
-# Clockify
+# Project mappings  (--map CLI convenience wrapper around common.py)
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Project mappings  (dir name → Clockify project ID)
-# ---------------------------------------------------------------------------
-
-def load_project_mappings() -> dict:
-    if os.path.exists(MAPPINGS_PATH):
-        with open(MAPPINGS_PATH) as f:
-            return json.load(f)
-    return {}
-
-
-def save_project_mapping(dir_name: str, project_id: str):
-    mappings = load_project_mappings()
-    mappings[dir_name] = project_id
-    with open(MAPPINGS_PATH, "w") as f:
-        json.dump(mappings, f, indent=2)
-    print(f"Mapped '{dir_name}' → {project_id}")
-
-
-def window_dir(window_name: str) -> str:
-    """Extract the leading directory segment from a Terminal window title."""
-    return window_name.split(" — ")[0].strip()
-
-
-# ---------------------------------------------------------------------------
-# Clockify project listing
-# ---------------------------------------------------------------------------
-
-def list_clockify_projects(config: dict) -> list:
-    """Return all non-archived projects in the workspace."""
-    projects = clockify_request(
-        "GET",
-        f"/workspaces/{config['workspace_id']}/projects?archived=false&page-size=500",
-        config["api_key"],
-    )
-    return projects
+def cmd_map(key: str, project_id: str):
+    key = common.normalize_key(key)
+    mappings = common.load_project_mappings()
+    mappings[key] = project_id
+    common.save_project_mappings(mappings)
+    print(f"Mapped '{key}' → {project_id}")
 
 
 def cmd_list_projects():
-    config = load_config()
-    projects = list_clockify_projects(config)
+    config = common.load_config()
+    projects = common.list_clockify_projects(config)
     if not projects:
         print("No projects found.")
         return
@@ -197,51 +203,51 @@ def cmd_list_projects():
         print(f"  {p['id']}  {p['name']}{client}")
 
 
+# ---------------------------------------------------------------------------
+# Aggregation + sending
+# ---------------------------------------------------------------------------
+
 def aggregate_entries(entries: list) -> dict:
-    """Group by window name → {window: {seconds, start, end}}."""
-    groups = defaultdict(lambda: {"seconds": 0, "start": None, "end": None})
+    """Group by activity key → {key: {seconds, start, end, titles: {title: seconds}}}."""
+    groups = defaultdict(lambda: {"seconds": 0, "start": None, "end": None, "titles": defaultdict(int)})
     for e in entries:
-        w = e["window"]
-        groups[w]["seconds"] += e["seconds"]
-        if groups[w]["start"] is None or e["start"] < groups[w]["start"]:
-            groups[w]["start"] = e["start"]
-        if groups[w]["end"] is None or e["end"] > groups[w]["end"]:
-            groups[w]["end"] = e["end"]
+        key = common.entry_key(e)
+        g = groups[key]
+        g["seconds"] += e["seconds"]
+        title = e.get("window", key)
+        g["titles"][title] += e["seconds"]
+        if g["start"] is None or e["start"] < g["start"]:
+            g["start"] = e["start"]
+        if g["end"] is None or e["end"] > g["end"]:
+            g["end"] = e["end"]
     return dict(groups)
 
 
-def clockify_request(method: str, path: str, api_key: str, body: dict = None):
-    url = f"https://api.clockify.me/api/v1{path}"
-    headers = {"X-Api-Key": api_key, "Content-Type": "application/json"}
-    data = json.dumps(body).encode() if body else None
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return json.loads(resp.read())
+def describe_group(key: str, group: dict) -> str:
+    """Pick the raw title with the greatest total duration in the group as the
+    Clockify description — resists title churn better than picking by count."""
+    if not group["titles"]:
+        return key
+    return max(group["titles"].items(), key=lambda kv: kv[1])[0]
 
 
 def send_to_clockify(config: dict, date_str: str, entries: list) -> int:
-    """Send aggregated daily entries to Clockify. Returns number of entries sent."""
-    entries = [e for e in entries if e["seconds"] <= MAX_ENTRY_SECONDS]
+    """Classify any newly-seen activity, then send aggregated daily entries to Clockify."""
+    mappings = ai_matcher.classify_and_save(config, entries)
     groups = aggregate_entries(entries)
-    mappings = load_project_mappings()
     sent = 0
-    for window, data in groups.items():
+    for key, data in groups.items():
         if data["seconds"] < MIN_ENTRY_SECONDS:
-            log.info(f"Skipping '{window}' ({data['seconds']}s, under minimum)")
-            continue
-        if data["seconds"] > MAX_ENTRY_SECONDS:
-            log.info(f"Skipping '{window}' ({data['seconds']}s, over maximum)")
+            log.info(f"Skipping '{key}' ({data['seconds']}s, under minimum)")
             continue
 
         start_dt = datetime.datetime.strptime(data["start"], "%Y-%m-%dT%H:%M:%SZ")
         end_dt = start_dt + datetime.timedelta(seconds=data["seconds"])
-
-        # Per-project mapping takes priority; fall back to global project_id
-        dir_name = window_dir(window)
-        project_id = mappings.get(dir_name) or config.get("project_id") or None
+        description = describe_group(key, data)
+        project_id = mappings.get(key) or config.get("project_id") or None
 
         body = {
-            "description": window,
+            "description": description,
             "start": start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "end": end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "billable": False,
@@ -250,23 +256,23 @@ def send_to_clockify(config: dict, date_str: str, entries: list) -> int:
             body["projectId"] = project_id
 
         try:
-            clockify_request(
+            common.clockify_request(
                 "POST",
                 f"/workspaces/{config['workspace_id']}/time-entries",
                 config["api_key"],
                 body,
             )
             mins = data["seconds"] // 60
-            log.info(f"Sent [{date_str}] '{window}' → {mins}m")
-            print(f"  ✓ '{window}' — {mins} min")
+            log.info(f"Sent [{date_str}] '{description}' ({key}) → {mins}m")
+            print(f"  ✓ '{description}' — {mins} min")
             sent += 1
         except urllib.error.HTTPError as e:
             err_body = e.read().decode()
-            log.error(f"Clockify HTTP {e.code} for '{window}': {err_body}")
-            print(f"  ✗ '{window}' — HTTP {e.code}: {err_body}")
+            log.error(f"Clockify HTTP {e.code} for '{key}': {err_body}")
+            print(f"  ✗ '{description}' — HTTP {e.code}: {err_body}")
         except Exception as e:
-            log.error(f"Clockify error for '{window}': {e}")
-            print(f"  ✗ '{window}' — {e}")
+            log.error(f"Clockify error for '{key}': {e}")
+            print(f"  ✗ '{description}' — {e}")
 
     return sent
 
@@ -294,7 +300,7 @@ def mark_date_sent(date_str: str):
 # ---------------------------------------------------------------------------
 
 def cmd_send(date_str: str):
-    config = load_config()
+    config = common.load_config()
     path = os.path.join(LOGS_DIR, f"{date_str}.json")
     entries = load_entries(path)
     if not entries:
@@ -306,7 +312,7 @@ def cmd_send(date_str: str):
         mark_date_sent(date_str)
         print(f"Done — {sent} entries sent.")
     else:
-        print("Nothing sent (all entries under 1 minute or errors).")
+        print("Nothing sent (all entries under the minimum duration or errors).")
 
 
 # ---------------------------------------------------------------------------
@@ -316,14 +322,13 @@ def cmd_send(date_str: str):
 class Tracker:
     def __init__(self):
         os.makedirs(LOGS_DIR, exist_ok=True)
-        self.config = load_config()
-        self.current_window: str | None = None
-        self.window_start: datetime.datetime | None = None
+        self.config = common.load_config()
+        self.current_activity: ActivityState | None = None
+        self.activity_start: datetime.datetime | None = None
+        self.is_idle: bool = False
         self.current_date = datetime.date.today()
         self.sent_dates = load_sent_dates()
 
-        self.current_chrome_tab: str | None = None
-        self.chrome_tab_start: datetime.datetime | None = None
         self._clockify_active_cache: bool = False
         self._clockify_last_check: datetime.datetime = (
             datetime.datetime.utcnow() - datetime.timedelta(seconds=CLOCKIFY_CHECK_INTERVAL)
@@ -333,36 +338,27 @@ class Tracker:
         signal.signal(signal.SIGTERM, self._on_shutdown)
         signal.signal(signal.SIGINT, self._on_shutdown)
 
-    def _flush_current(self, now: datetime.datetime):
-        """Write the active window's elapsed time to the daily log."""
-        if self.current_window and self.window_start:
-            path = log_path_for(self.current_date)
-            append_entry(path, self.current_window, self.window_start, now)
-        self.current_window = None
-        self.window_start = None
+    def _min_duration_for(self, source: str) -> int:
+        configured = self.config.get("min_duration_seconds", {})
+        return configured.get(source, common.DEFAULT_MIN_DURATION_SECONDS.get(source, 1))
 
-    def _flush_chrome(self, now: datetime.datetime):
-        """Write the active Chrome tab's elapsed time only if it met the minimum focus duration."""
-        if self.current_chrome_tab and self.chrome_tab_start:
+    def _flush_current(self, now: datetime.datetime):
+        """Write the current activity's elapsed time to the daily log."""
+        if self.current_activity and self.activity_start and now > self.activity_start:
             path = log_path_for(self.current_date)
-            append_entry(path, self.current_chrome_tab, self.chrome_tab_start, now,
-                         min_duration=CHROME_MIN_SECONDS)
-        self.current_chrome_tab = None
-        self.chrome_tab_start = None
+            min_duration = self._min_duration_for(self.current_activity.source)
+            append_activity(path, self.current_activity, self.activity_start, now, min_duration)
+        self.current_activity = None
+        self.activity_start = None
 
     def _discard_current(self):
-        """Discard the current terminal session without logging it."""
-        self.current_window = None
-        self.window_start = None
-
-    def _discard_chrome(self):
-        """Discard the current Chrome tab session without logging it."""
-        self.current_chrome_tab = None
-        self.chrome_tab_start = None
+        """Discard the current activity without logging it."""
+        self.current_activity = None
+        self.activity_start = None
 
     def _get_user_id(self) -> str:
         if not self._user_id:
-            user = clockify_request("GET", "/user", self.config["api_key"])
+            user = common.clockify_request("GET", "/user", self.config["api_key"])
             self._user_id = user["id"]
         return self._user_id
 
@@ -373,7 +369,7 @@ class Tracker:
             return self._clockify_active_cache
         try:
             uid = self._get_user_id()
-            entries = clockify_request(
+            entries = common.clockify_request(
                 "GET",
                 f"/workspaces/{self.config['workspace_id']}/user/{uid}/time-entries?in-progress=true&page-size=1",
                 self.config["api_key"],
@@ -405,10 +401,9 @@ class Tracker:
         self.current_date = today
 
     def _on_shutdown(self, signum, frame):
-        log.info("Shutdown signal received — flushing current window.")
+        log.info("Shutdown signal received — flushing current activity.")
         now = datetime.datetime.utcnow()
         self._flush_current(now)
-        self._flush_chrome(now)
         sys.exit(0)
 
     def run(self):
@@ -419,36 +414,49 @@ class Tracker:
         while True:
             now = datetime.datetime.utcnow()
             self._check_midnight()
-            active = get_active_window()
             timer_running = self._has_clockify_active_timer()
 
             if timer_running:
                 # A Clockify timer is active — discard any in-progress tracking
-                if self.current_window:
+                if self.current_activity:
                     self._discard_current()
-                if self.current_chrome_tab:
-                    self._discard_chrome()
-            else:
-                # Terminal tracking
-                if active != self.current_window:
-                    self._flush_current(now)
-                    if active:
-                        self.current_window = active
-                        self.window_start = now
-                        log.debug(f"Window focus: '{active}'")
+                time.sleep(POLL_INTERVAL)
+                continue
 
-                # Chrome tracking: only when Terminal is not focused
-                if not active:
-                    chrome_active = get_active_chrome_tab()
-                    if chrome_active != self.current_chrome_tab:
-                        self._flush_chrome(now)
-                        if chrome_active:
-                            self.current_chrome_tab = chrome_active
-                            self.chrome_tab_start = now
-                            log.debug(f"Chrome tab focus: '{chrome_active}'")
-                elif self.current_chrome_tab:
-                    # Terminal took focus — flush any in-progress Chrome session
-                    self._flush_chrome(now)
+            idle_threshold = self.config.get("idle_threshold_seconds", common.DEFAULT_IDLE_THRESHOLD_SECONDS)
+            idle_seconds = common.get_idle_seconds()
+            in_video = self.current_activity is not None and common.is_video_context(
+                self.current_activity.source, self.current_activity.app,
+                self.current_activity.url, self.config,
+            )
+
+            if idle_seconds >= idle_threshold and not in_video:
+                if not self.is_idle:
+                    # Close out the session at the moment input actually stopped,
+                    # not at the moment idle crossed the threshold.
+                    idle_since = now - datetime.timedelta(seconds=idle_seconds)
+                    if self.activity_start and idle_since < self.activity_start:
+                        idle_since = self.activity_start
+                    self._flush_current(idle_since)
+                    self.is_idle = True
+                    log.info(f"Idle for {idle_seconds:.0f}s — closed session at {idle_since.isoformat()}")
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            if self.is_idle:
+                log.info("No longer idle — resuming capture.")
+                self.is_idle = False
+
+            activity = classify_frontmost(self.config)
+            current_key = self.current_activity.key if self.current_activity else None
+            new_key = activity.key if activity else None
+
+            if new_key != current_key:
+                self._flush_current(now)
+                if activity:
+                    self.current_activity = activity
+                    self.activity_start = now
+                    log.debug(f"Activity focus: '{activity.key}' ({activity.window})")
 
             time.sleep(POLL_INTERVAL)
 
@@ -488,7 +496,7 @@ if __name__ == "__main__":
         elif sys.argv[1] == "--list-projects":
             cmd_list_projects()
         elif sys.argv[1] == "--map" and len(sys.argv) == 4:
-            save_project_mapping(sys.argv[2], sys.argv[3])
+            cmd_map(sys.argv[2], sys.argv[3])
         else:
             print(__doc__)
     else:

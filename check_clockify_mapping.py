@@ -30,7 +30,7 @@ def main():
     if not project_dir:
         sys.exit(0)
 
-    dir_name = os.path.basename(project_dir.rstrip("/"))
+    dir_name = os.path.basename(project_dir.rstrip("/")).lower()
     mappings = load_mappings()
 
     if dir_name not in mappings:

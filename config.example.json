@@ -2,7 +2,14 @@
   "api_key": "<your Clockify API key>",
   "workspace_id": "<your workspace ID>",
   "project_id": "<optional default project ID — leave blank or remove this key>",
-  "anthropic_api_key": "<optional — enables AI-powered bulk project matching via ai_matcher.py>",
+  "anthropic_api_key": "<optional — enables AI-powered project classification via ai_matcher.py>",
   "telegram_bot_token": "<optional — enables Telegram reminders and watchdog alerts>",
-  "telegram_chat_id": "<your Telegram chat ID, from https://api.telegram.org/bot<token>/getUpdates>"
+  "telegram_chat_id": "<your Telegram chat ID, from https://api.telegram.org/bot<token>/getUpdates>",
+  "blocked_apps": [],
+  "blocked_domains": [],
+  "video_apps": ["zoom.us", "FaceTime", "QuickTime Player", "VLC"],
+  "video_domains": ["youtube.com", "netflix.com", "vimeo.com", "twitch.tv", "meet.google.com", "zoom.us"],
+  "idle_threshold_seconds": 600,
+  "min_duration_seconds": {"terminal": 1, "chrome": 60, "app": 60},
+  "generic_domains": ["accounts.google.com", "myaccount.google.com", "login.microsoftonline.com", "okta.com"]
 }
