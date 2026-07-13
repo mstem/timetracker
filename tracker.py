@@ -3,16 +3,18 @@
 Mac activity time tracker.
 Polls the frontmost app/window every 2 seconds — Terminal, Chrome tabs (with
 URL), or any other app via System Events — logs time per activity, and sends
-aggregated daily entries to Clockify at midnight (or on next start). Any
-newly-seen activity is classified into a Clockify project by Claude right
-before sending.
+aggregated daily entries to Kimai at midnight (or on next start). Any
+newly-seen activity is classified into a Kimai project by Claude right
+before sending. External calendar meetings are synced to Kimai on the same
+schedule (see calendar_sync).
 
 Usage:
-  python3 tracker.py                          # run as daemon
-  python3 tracker.py --send-today             # manually send today's log
-  python3 tracker.py --send DATE              # manually send a specific date (YYYY-MM-DD)
-  python3 tracker.py --list-projects          # list all Clockify projects
-  python3 tracker.py --map KEY PROJECT_ID     # map an activity key to a Clockify project ID
+  python3 tracker.py                               # run as daemon
+  python3 tracker.py --send-today                  # manually send today's log
+  python3 tracker.py --send DATE                   # manually send a specific date (YYYY-MM-DD)
+  python3 tracker.py --list-projects               # list all Kimai projects
+  python3 tracker.py --list-activities             # list all Kimai activities
+  python3 tracker.py --map KEY PROJECT_ID ACTIVITY_ID  # map an activity key to a Kimai project+activity
 """
 
 from __future__ import annotations
@@ -38,7 +40,7 @@ SENT_FILE = os.path.join(BASE_DIR, "sent_dates.json")
 LOG_FILE = os.path.join(BASE_DIR, "tracker.log")
 POLL_INTERVAL = 2  # seconds
 MIN_ENTRY_SECONDS = 5  # hardcoded final floor when aggregating for send — not a tuning knob
-CLOCKIFY_CHECK_INTERVAL = 60  # seconds between Clockify active-timer API checks
+KIMAI_CHECK_INTERVAL = 60  # seconds between Kimai active-timesheet API checks
 
 logging.basicConfig(
     filename=LOG_FILE,
@@ -87,21 +89,56 @@ class ActivityState:
     key: str
 
 
+# A failed probe (osascript nonzero exit, timeout, or a wedged System Events
+# returning -600) looks identical to "nothing trackable is frontmost": both
+# yield no activity. But a persistent failure means capture is silently paused,
+# so surface it at WARN — throttled to ~once/min so a stuck System Events
+# doesn't flood the log at the 2s poll rate — and note when it recovers.
+_PROBE_WARN_INTERVAL = 60  # seconds
+_last_probe_warn = 0.0
+_probe_failing = False
+
+
+def _warn_probe_failure(detail: str):
+    global _last_probe_warn, _probe_failing
+    _probe_failing = True
+    now = time.monotonic()
+    if now - _last_probe_warn >= _PROBE_WARN_INTERVAL:
+        log.warning(f"get_frontmost probe failed ({detail}) — capture paused until it recovers")
+        _last_probe_warn = now
+
+
+def _note_probe_ok():
+    global _probe_failing
+    if _probe_failing:
+        log.info("get_frontmost probe recovered — capture resumed")
+        _probe_failing = False
+
+
 def get_frontmost():
-    """Return (app_name, window_title) for whichever app is frontmost, or None."""
+    """Return (app_name, window_title) for whichever app is frontmost, or None.
+
+    Returns None both when nothing trackable is frontmost and when the probe
+    itself fails; the latter is logged (see _warn_probe_failure) rather than
+    silently swallowed.
+    """
     try:
         result = subprocess.run(
             ["osascript", "-e", SYSTEM_EVENTS_SCRIPT],
             capture_output=True, text=True, timeout=3
         )
-        raw = result.stdout.rstrip("\r\n")
-        if "\x1f" not in raw:
-            return None
-        app_name, window_title = raw.split("\x1f", 1)
-        return (app_name, window_title) if app_name else None
     except Exception as e:
-        log.debug(f"osascript system events error: {e}")
+        _warn_probe_failure(f"osascript did not run: {e}")
         return None
+    if result.returncode != 0:
+        _warn_probe_failure(f"osascript exit {result.returncode}: {result.stderr.strip()}")
+        return None
+    _note_probe_ok()
+    raw = result.stdout.rstrip("\r\n")
+    if "\x1f" not in raw:
+        return None
+    app_name, window_title = raw.split("\x1f", 1)
+    return (app_name, window_title) if app_name else None
 
 
 def get_chrome_url():
@@ -112,7 +149,7 @@ def get_chrome_url():
             capture_output=True, text=True, timeout=3
         )
         url = result.stdout.strip()
-        return url or None
+        return common.strip_url_params(url) or None
     except Exception as e:
         log.debug(f"osascript chrome url error: {e}")
         return None
@@ -184,23 +221,38 @@ def append_activity(path: str, activity: ActivityState, start: datetime.datetime
 # Project mappings  (--map CLI convenience wrapper around common.py)
 # ---------------------------------------------------------------------------
 
-def cmd_map(key: str, project_id: str):
+def cmd_map(key: str, project_id: str, activity_id: str):
     key = common.normalize_key(key)
     mappings = common.load_project_mappings()
-    mappings[key] = project_id
+    mappings[key] = {"project": int(project_id), "activity": int(activity_id)}
     common.save_project_mappings(mappings)
-    print(f"Mapped '{key}' → {project_id}")
+    print(f"Mapped '{key}' → project {project_id}, activity {activity_id}")
 
 
 def cmd_list_projects():
     config = common.load_config()
-    projects = common.list_clockify_projects(config)
+    projects = common.list_kimai_projects(config)
     if not projects:
         print("No projects found.")
         return
     for p in projects:
-        client = f"  [{p.get('clientName', '')}]" if p.get("clientName") else ""
-        print(f"  {p['id']}  {p['name']}{client}")
+        customer = p.get("customer")
+        cust = ""
+        if isinstance(customer, dict) and customer.get("name"):
+            cust = f"  [{customer['name']}]"
+        print(f"  {p['id']}  {p['name']}{cust}")
+
+
+def cmd_list_activities():
+    config = common.load_config()
+    activities = common.list_kimai_activities(config)
+    if not activities:
+        print("No activities found.")
+        return
+    for a in activities:
+        proj = a.get("project")
+        scope = f"  (project {proj})" if proj else "  (global)"
+        print(f"  {a['id']}  {a['name']}{scope}")
 
 
 # ---------------------------------------------------------------------------
@@ -225,53 +277,124 @@ def aggregate_entries(entries: list) -> dict:
 
 def describe_group(key: str, group: dict) -> str:
     """Pick the raw title with the greatest total duration in the group as the
-    Clockify description — resists title churn better than picking by count."""
+    Kimai description — resists title churn better than picking by count."""
     if not group["titles"]:
         return key
     return max(group["titles"].items(), key=lambda kv: kv[1])[0]
 
 
-def send_to_clockify(config: dict, date_str: str, entries: list) -> int:
-    """Classify any newly-seen activity, then send aggregated daily entries to Clockify."""
+def _parse_z(ts: str) -> datetime.datetime:
+    return datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
+
+
+def subtract_meetings(entries: list, meetings: list) -> list:
+    """Remove the time spans covered by synced calendar meetings from the raw
+    tracker entries, so meeting time isn't counted twice (the calendar sync
+    already logged it). Each entry is clipped to the sub-spans that fall
+    *outside* every meeting interval; ad-hoc call time with no calendar event
+    survives untouched. `meetings` is a list of (start_utc, end_utc) datetimes.
+
+    Implements the "suppress overlaps only" dedup decision.
+    """
+    if not meetings:
+        return entries
+    result = []
+    for e in entries:
+        spans = [(_parse_z(e["start"]), _parse_z(e["end"]))]
+        for m_start, m_end in meetings:
+            next_spans = []
+            for s, x in spans:
+                if m_end <= s or m_start >= x:      # no overlap
+                    next_spans.append((s, x))
+                    continue
+                if s < m_start:                     # keep the piece before the meeting
+                    next_spans.append((s, m_start))
+                if m_end < x:                       # keep the piece after the meeting
+                    next_spans.append((m_end, x))
+            spans = next_spans
+        for s, x in spans:
+            secs = int((x - s).total_seconds())
+            if secs <= 0:
+                continue
+            clipped = dict(e)
+            clipped["start"] = s.strftime("%Y-%m-%dT%H:%M:%SZ")
+            clipped["end"] = x.strftime("%Y-%m-%dT%H:%M:%SZ")
+            clipped["seconds"] = secs
+            result.append(clipped)
+    return result
+
+
+def _sync_meetings(config: dict, date_str: str) -> list:
+    """Log qualifying external calendar meetings to Kimai and return their UTC
+    (start, end) intervals for overlap suppression. No-op unless calendar sync
+    is enabled and configured. Never blocks the tracker send on failure."""
+    if not config.get("calendar_sync_enabled"):
+        return []
+    try:
+        import calendar_sync
+    except Exception as e:
+        log.error(f"calendar_sync import failed: {e}")
+        return []
+    try:
+        return calendar_sync.sync_day(config, date_str)
+    except Exception as e:
+        log.error(f"Calendar sync failed for {date_str}: {e}")
+        return []
+
+
+def send_to_kimai(config: dict, date_str: str, entries: list) -> int:
+    """Sync external calendar meetings, then classify newly-seen activity and
+    send aggregated daily tracker entries to Kimai (minus any time already
+    covered by a synced meeting)."""
+    meetings = _sync_meetings(config, date_str)
+    entries = subtract_meetings(entries, meetings)
+
     mappings = ai_matcher.classify_and_save(config, entries)
     groups = aggregate_entries(entries)
+    default_project = config.get("default_project_id")
+    default_activity = config.get("default_activity_id")
     sent = 0
     for key, data in groups.items():
         if data["seconds"] < MIN_ENTRY_SECONDS:
             log.info(f"Skipping '{key}' ({data['seconds']}s, under minimum)")
             continue
 
-        start_dt = datetime.datetime.strptime(data["start"], "%Y-%m-%dT%H:%M:%SZ")
+        start_dt = _parse_z(data["start"])
         end_dt = start_dt + datetime.timedelta(seconds=data["seconds"])
         description = describe_group(key, data)
-        project_id = mappings.get(key) or config.get("project_id") or None
+
+        mapping = mappings.get(key) or {}
+        project_id = mapping.get("project") or default_project
+        activity_id = mapping.get("activity") or default_activity
+        if not project_id or not activity_id:
+            # Kimai requires both — without a mapping and without configured
+            # defaults there's nowhere to file this; leave it for a later run.
+            log.warning(f"Skipping '{key}' ({data['seconds']}s): no project/activity mapping and no defaults set")
+            print(f"  ⚠ '{description}' — no Kimai project/activity (mapping or defaults missing)")
+            continue
 
         body = {
+            "begin": common.kimai_local_time(start_dt, config),
+            "end": common.kimai_local_time(end_dt, config),
+            "project": project_id,
+            "activity": activity_id,
             "description": description,
-            "start": start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "end": end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "billable": False,
+            "exported": False,
         }
-        if project_id:
-            body["projectId"] = project_id
 
         try:
-            common.clockify_request(
-                "POST",
-                f"/workspaces/{config['workspace_id']}/time-entries",
-                config["api_key"],
-                body,
-            )
+            common.kimai_request(config, "POST", "/timesheets", body)
             mins = data["seconds"] // 60
             log.info(f"Sent [{date_str}] '{description}' ({key}) → {mins}m")
             print(f"  ✓ '{description}' — {mins} min")
             sent += 1
         except urllib.error.HTTPError as e:
             err_body = e.read().decode()
-            log.error(f"Clockify HTTP {e.code} for '{key}': {err_body}")
+            log.error(f"Kimai HTTP {e.code} for '{key}': {err_body}")
             print(f"  ✗ '{description}' — HTTP {e.code}: {err_body}")
         except Exception as e:
-            log.error(f"Clockify error for '{key}': {e}")
+            log.error(f"Kimai error for '{key}': {e}")
             print(f"  ✗ '{description}' — {e}")
 
     return sent
@@ -307,7 +430,7 @@ def cmd_send(date_str: str):
         print(f"No log found for {date_str}")
         return
     print(f"Sending {len(entries)} raw entries for {date_str}...")
-    sent = send_to_clockify(config, date_str, entries)
+    sent = send_to_kimai(config, date_str, entries)
     if sent:
         mark_date_sent(date_str)
         print(f"Done — {sent} entries sent.")
@@ -321,7 +444,8 @@ def cmd_send(date_str: str):
 
 class Tracker:
     def __init__(self):
-        os.makedirs(LOGS_DIR, exist_ok=True)
+        os.makedirs(LOGS_DIR, mode=0o700, exist_ok=True)
+        os.chmod(LOGS_DIR, 0o700)  # makedirs mode is ignored when the dir already exists
         self.config = common.load_config()
         self.current_activity: ActivityState | None = None
         self.activity_start: datetime.datetime | None = None
@@ -329,11 +453,10 @@ class Tracker:
         self.current_date = datetime.date.today()
         self.sent_dates = load_sent_dates()
 
-        self._clockify_active_cache: bool = False
-        self._clockify_last_check: datetime.datetime = (
-            datetime.datetime.utcnow() - datetime.timedelta(seconds=CLOCKIFY_CHECK_INTERVAL)
+        self._kimai_active_cache: bool = False
+        self._kimai_last_check: datetime.datetime = (
+            datetime.datetime.utcnow() - datetime.timedelta(seconds=KIMAI_CHECK_INTERVAL)
         )
-        self._user_id: str | None = None
 
         signal.signal(signal.SIGTERM, self._on_shutdown)
         signal.signal(signal.SIGINT, self._on_shutdown)
@@ -356,30 +479,19 @@ class Tracker:
         self.current_activity = None
         self.activity_start = None
 
-    def _get_user_id(self) -> str:
-        if not self._user_id:
-            user = common.clockify_request("GET", "/user", self.config["api_key"])
-            self._user_id = user["id"]
-        return self._user_id
-
-    def _has_clockify_active_timer(self) -> bool:
-        """Return True if Clockify has a running timer. Result is cached for CLOCKIFY_CHECK_INTERVAL seconds."""
+    def _has_kimai_active_timer(self) -> bool:
+        """Return True if Kimai has a running timesheet. Result is cached for KIMAI_CHECK_INTERVAL seconds."""
         now = datetime.datetime.utcnow()
-        if (now - self._clockify_last_check).total_seconds() < CLOCKIFY_CHECK_INTERVAL:
-            return self._clockify_active_cache
+        if (now - self._kimai_last_check).total_seconds() < KIMAI_CHECK_INTERVAL:
+            return self._kimai_active_cache
         try:
-            uid = self._get_user_id()
-            entries = common.clockify_request(
-                "GET",
-                f"/workspaces/{self.config['workspace_id']}/user/{uid}/time-entries?in-progress=true&page-size=1",
-                self.config["api_key"],
-            )
-            self._clockify_active_cache = bool(entries)
+            # /timesheets/active is already scoped to the authenticated user.
+            self._kimai_active_cache = bool(common.kimai_active_timesheet(self.config))
         except Exception as e:
-            log.debug(f"Clockify active-timer check failed: {e}")
-            self._clockify_active_cache = False
-        self._clockify_last_check = now
-        return self._clockify_active_cache
+            log.debug(f"Kimai active-timer check failed: {e}")
+            self._kimai_active_cache = False
+        self._kimai_last_check = now
+        return self._kimai_active_cache
 
     def _check_midnight(self):
         today = datetime.date.today()
@@ -393,7 +505,7 @@ class Tracker:
             entries = load_entries(path)
             if entries:
                 try:
-                    send_to_clockify(self.config, yesterday, entries)
+                    send_to_kimai(self.config, yesterday, entries)
                     mark_date_sent(yesterday)
                     self.sent_dates.add(yesterday)
                 except Exception as e:
@@ -414,10 +526,10 @@ class Tracker:
         while True:
             now = datetime.datetime.utcnow()
             self._check_midnight()
-            timer_running = self._has_clockify_active_timer()
+            timer_running = self._has_kimai_active_timer()
 
             if timer_running:
-                # A Clockify timer is active — discard any in-progress tracking
+                # A Kimai timesheet is running — discard any in-progress tracking
                 if self.current_activity:
                     self._discard_current()
                 time.sleep(POLL_INTERVAL)
@@ -476,7 +588,7 @@ class Tracker:
             entries = load_entries(path)
             if entries:
                 try:
-                    send_to_clockify(self.config, date_str, entries)
+                    send_to_kimai(self.config, date_str, entries)
                     mark_date_sent(date_str)
                     self.sent_dates.add(date_str)
                 except Exception as e:
@@ -495,8 +607,10 @@ if __name__ == "__main__":
             cmd_send(sys.argv[2])
         elif sys.argv[1] == "--list-projects":
             cmd_list_projects()
-        elif sys.argv[1] == "--map" and len(sys.argv) == 4:
-            cmd_map(sys.argv[2], sys.argv[3])
+        elif sys.argv[1] == "--list-activities":
+            cmd_list_activities()
+        elif sys.argv[1] == "--map" and len(sys.argv) == 5:
+            cmd_map(sys.argv[2], sys.argv[3], sys.argv[4])
         else:
             print(__doc__)
     else:

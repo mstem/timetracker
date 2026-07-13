@@ -1,9 +1,16 @@
 """
-Shared helpers for tracker.py and ai_matcher.py: config loading, the Clockify
+Shared helpers for tracker.py and ai_matcher.py: config loading, the Kimai
 and Anthropic HTTP clients, project-mapping storage, activity-key derivation,
 blocklist/video-context checks, and idle-time detection.
+
+Time backend is Kimai (self-hosted, https://github.com/kimai/kimai). Kimai's
+data model is Customer -> Project -> Activity, and every timesheet needs BOTH
+a project and an activity, so mapping values are {"project": id, "activity": id}
+(see normalize_mapping_value). Timesheet begin/end are local wall-clock time in
+the instance timezone, not UTC — see kimai_local_time.
 """
 
+import datetime
 import json
 import logging
 import os
@@ -14,12 +21,17 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlparse
 
+try:
+    from zoneinfo import ZoneInfo   # stdlib 3.9+, backed by the system tzdata on macOS
+except ImportError:  # pragma: no cover - very old Python
+    ZoneInfo = None
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 MAPPINGS_PATH = os.path.join(BASE_DIR, "project_mappings.json")
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
 
-CLOCKIFY_API_BASE = "https://api.clockify.me/api/v1"
+DEFAULT_KIMAI_TIMEZONE = "UTC"
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 ANTHROPIC_VERSION = "2023-06-01"
@@ -54,78 +66,149 @@ log = logging.getLogger(__name__)
 # Config
 # ---------------------------------------------------------------------------
 
+def _is_unset(val) -> bool:
+    return not val or (isinstance(val, str) and val.startswith("<"))
+
+
 def load_config() -> dict:
     if not os.path.exists(CONFIG_PATH):
         print(f"ERROR: config.json not found at {CONFIG_PATH}")
-        print("Run setup.sh first and fill in your API key and workspace ID.")
+        print("Run setup.sh first and fill in your Kimai URL and API token.")
         sys.exit(1)
+    os.chmod(CONFIG_PATH, 0o600)  # holds API keys — keep out of reach of other local users
     with open(CONFIG_PATH) as f:
         cfg = json.load(f)
-    for key in ("api_key", "workspace_id"):
-        if not cfg.get(key) or cfg[key].startswith("<"):
+    for key in ("kimai_url", "kimai_token"):
+        if _is_unset(cfg.get(key)):
             print(f"ERROR: '{key}' not set in config.json")
             sys.exit(1)
+    cfg["kimai_url"] = cfg["kimai_url"].rstrip("/")
     return cfg
 
 
 def require_anthropic_key(config: dict):
     """Return the Anthropic API key, or None if not configured (AI features are opt-in)."""
     key = config.get("anthropic_api_key", "")
-    if not key or key.startswith("<"):
-        return None
-    return key
+    return None if _is_unset(key) else key
 
 
 # ---------------------------------------------------------------------------
-# Clockify
+# Kimai
 # ---------------------------------------------------------------------------
 
-def clockify_request(method: str, path: str, api_key: str, body: dict = None):
-    url = f"{CLOCKIFY_API_BASE}{path}"
-    headers = {"X-Api-Key": api_key, "Content-Type": "application/json"}
-    data = json.dumps(body).encode() if body else None
+def kimai_request(config: dict, method: str, path: str, body: dict = None):
+    """Call the Kimai REST API. Auth is a Bearer API token (Kimai 2.x).
+
+    `path` is relative to /api, e.g. "/timesheets". Returns the decoded JSON,
+    or None for empty (204) responses.
+    """
+    url = f"{config['kimai_url']}/api{path}"
+    headers = {
+        "Authorization": f"Bearer {config['kimai_token']}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return json.loads(resp.read())
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        raw = resp.read()
+        return json.loads(raw) if raw else None
 
 
-def list_clockify_projects(config: dict) -> list:
-    """Return all non-archived projects in the workspace."""
-    return clockify_request(
-        "GET",
-        f"/workspaces/{config['workspace_id']}/projects?archived=false&page-size=500",
-        config["api_key"],
-    )
+def list_kimai_projects(config: dict) -> list:
+    """Return all visible (non-archived) Kimai projects."""
+    return kimai_request(config, "GET", "/projects?visible=1") or []
 
 
-def create_clockify_project(config: dict, name: str) -> dict:
-    """Create a new Clockify project and return it."""
-    return clockify_request(
-        "POST",
-        f"/workspaces/{config['workspace_id']}/projects",
-        config["api_key"],
-        {"name": name, "billable": False},
-    )
+def list_kimai_activities(config: dict, project_id=None) -> list:
+    """Return visible Kimai activities, optionally scoped to a project (also
+    includes global activities when a project is given)."""
+    path = "/activities?visible=1"
+    if project_id is not None:
+        path += f"&project={project_id}&globals=true"
+    return kimai_request(config, "GET", path) or []
+
+
+def list_kimai_customers(config: dict) -> list:
+    return kimai_request(config, "GET", "/customers?visible=1") or []
+
+
+def create_kimai_customer(config: dict, name: str) -> dict:
+    # visible=True is required: Kimai's API defaults new entities to hidden, and
+    # a hidden customer is not an accepted "choice" when creating a project under it.
+    return kimai_request(config, "POST", "/customers", {"name": name, "country": "US", "currency": "USD", "timezone": kimai_timezone(config), "visible": True})
+
+
+def create_kimai_project(config: dict, name: str, customer_id: int) -> dict:
+    return kimai_request(config, "POST", "/projects", {"name": name, "customer": customer_id, "visible": True})
+
+
+def create_kimai_activity(config: dict, name: str, project_id=None) -> dict:
+    """Create an activity. Omit project_id for a global activity usable everywhere."""
+    body = {"name": name, "visible": True}
+    if project_id is not None:
+        body["project"] = project_id
+    return kimai_request(config, "POST", "/activities", body)
+
+
+def kimai_active_timesheet(config: dict) -> list:
+    """Return the user's currently-running timesheets (empty if none)."""
+    return kimai_request(config, "GET", "/timesheets/active") or []
+
+
+# ---------------------------------------------------------------------------
+# Kimai timestamps
+# ---------------------------------------------------------------------------
+
+def kimai_timezone(config: dict) -> str:
+    return config.get("kimai_timezone") or DEFAULT_KIMAI_TIMEZONE
+
+
+def kimai_local_time(dt_utc: datetime.datetime, config: dict) -> str:
+    """Convert a naive-UTC datetime to the Kimai instance's local wall-clock
+    time in the HTML5 format Kimai expects (no trailing 'Z')."""
+    aware = dt_utc.replace(tzinfo=datetime.timezone.utc)
+    tz = config.get("kimai_timezone") or DEFAULT_KIMAI_TIMEZONE
+    if ZoneInfo is not None:
+        try:
+            aware = aware.astimezone(ZoneInfo(tz))
+        except Exception:
+            log.warning(f"Unknown kimai_timezone {tz!r}; sending UTC wall-clock time")
+    return aware.strftime("%Y-%m-%dT%H:%M:%S")
 
 
 # ---------------------------------------------------------------------------
 # Project mappings  (shared format between tracker.py and ai_matcher.py)
 # ---------------------------------------------------------------------------
+#
+# A mapping value is a dict {"project": <kimai project id>, "activity": <kimai
+# activity id>} — Kimai timesheets require both. normalize_mapping_value keeps
+# reading the legacy Clockify format (a bare project-id string) so old files and
+# hand edits still load; those legacy values carry no activity and are treated
+# as project-only (the caller falls back to the default activity).
+
+def normalize_mapping_value(val) -> dict:
+    """Coerce a stored mapping value into {"project": id, "activity": id|None}.
+    Accepts the legacy Clockify form (a bare project-id string) too."""
+    if isinstance(val, dict):
+        return {"project": val.get("project"), "activity": val.get("activity")}
+    return {"project": val, "activity": None}   # legacy: bare Clockify project id
+
 
 def load_project_mappings() -> dict:
     if os.path.exists(MAPPINGS_PATH):
         with open(MAPPINGS_PATH) as f:
             raw = json.load(f)
-        # Normalize on load too, in case the file was hand-edited or predates
-        # normalize_key — later duplicate wins, but keys are normalized at
-        # write time so collisions shouldn't occur in practice.
-        return {normalize_key(k): v for k, v in raw.items()}
+        # Normalize keys and values on load too, in case the file was
+        # hand-edited or predates the current format — later duplicate wins,
+        # but keys are normalized at write time so collisions shouldn't occur.
+        return {normalize_key(k): normalize_mapping_value(v) for k, v in raw.items()}
     return {}
 
 
 def save_project_mappings(mappings: dict):
     """Write atomically to avoid corruption if the tracker daemon is running."""
-    mappings = {normalize_key(k): v for k, v in mappings.items()}
+    mappings = {normalize_key(k): normalize_mapping_value(v) for k, v in mappings.items()}
     tmp = MAPPINGS_PATH + ".tmp"
     with open(tmp, "w") as f:
         json.dump(mappings, f, indent=2)
@@ -170,6 +253,15 @@ def chrome_domain(url: str) -> str:
     if netloc.startswith("www."):
         netloc = netloc[4:]
     return netloc or "internal"
+
+
+def strip_url_params(url: str) -> str:
+    """Drop the query string and fragment before a URL is stored anywhere —
+    they can carry OAuth codes/session tokens, and nothing downstream needs
+    more than the domain."""
+    if not url:
+        return url
+    return urlparse(url)._replace(query="", fragment="").geturl()
 
 
 def activity_key(source: str, window: str, url: str = None, app: str = None) -> str:

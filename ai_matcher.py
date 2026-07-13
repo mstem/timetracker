@@ -2,8 +2,10 @@
 """
 AI-powered project classifier for the activity tracker.
 Scans recent log files, finds activity keys (Terminal directory names,
-Chrome tab domains, or other app names) with no Clockify mapping, and uses
-Claude to match them against your Clockify projects in one batch call.
+Chrome tab domains, or other app names) with no Kimai mapping, and uses
+Claude to match them against your Kimai projects in one batch call. Claude
+picks a project; the project's activity is resolved locally (Kimai timesheets
+need both), so a saved mapping is {"project": id, "activity": id}.
 Matched results are saved to project_mappings.json and never re-queried.
 
 `classify_and_save()` is also called automatically by tracker.py right
@@ -113,7 +115,11 @@ def classify_keys_with_claude(api_key: str, unmapped: dict, projects: list, mapp
 
     examples_block = ""
     if mappings:
-        sample = {k: project_by_id[v] for k, v in list(mappings.items())[:15] if v in project_by_id}
+        sample = {}
+        for k, v in list(mappings.items())[:15]:
+            pid = v.get("project") if isinstance(v, dict) else v
+            if pid in project_by_id:
+                sample[k] = project_by_id[pid]
         if sample:
             examples_block = (
                 "\nExamples of activity keys this user has already confirmed map to a "
@@ -123,7 +129,7 @@ def classify_keys_with_claude(api_key: str, unmapped: dict, projects: list, mapp
 
     system = (
         "You are a project-matching assistant for a personal time tracker. "
-        "Map activity keys to Clockify project IDs. Activity keys come in three "
+        "Map activity keys to Kimai project IDs. Activity keys come in three "
         "forms: a bare directory name (from a macOS Terminal window title), "
         "'chrome:<domain>' (a Chrome tab's domain), or 'app:<AppName>' (any other "
         "application's name). Use the sample window/tab titles given for each key "
@@ -132,10 +138,10 @@ def classify_keys_with_claude(api_key: str, unmapped: dict, projects: list, mapp
     )
 
     user = (
-        "Match each activity key to the most appropriate Clockify project.\n"
+        "Match each activity key to the most appropriate Kimai project.\n"
         f"{examples_block}\n"
         f"Activity keys to match, with sample titles seen for each:\n{json.dumps(unmapped, indent=2)}\n\n"
-        f"Available Clockify projects (name → id):\n{json.dumps(project_map, indent=2)}\n\n"
+        f"Available Kimai projects (name → id):\n{json.dumps(project_map, indent=2)}\n\n"
         "Rules:\n"
         "- Only return a project ID when the sample titles reference something "
         "specific — a named project, client, document, or task — that clearly "
@@ -168,10 +174,13 @@ def classify_keys_with_claude(api_key: str, unmapped: dict, projects: list, mapp
     if not isinstance(result, dict):
         raise RuntimeError(f"Claude returned unexpected type: {type(result)}")
 
-    # Validate: returned IDs must exist in the project list
+    # Validate: returned IDs must exist in the project list. Kimai IDs are
+    # integers; tolerate Claude returning them as numeric strings.
     valid_ids = {p["id"] for p in projects}
     validated = {}
     for key, project_id in result.items():
+        if isinstance(project_id, str) and project_id.isdigit():
+            project_id = int(project_id)
         if project_id is None:
             validated[key] = None
         elif project_id in valid_ids:
@@ -181,6 +190,41 @@ def classify_keys_with_claude(api_key: str, unmapped: dict, projects: list, mapp
             validated[key] = None
 
     return validated
+
+
+# ---------------------------------------------------------------------------
+# Activity resolution  (Kimai timesheets need a project AND an activity)
+# ---------------------------------------------------------------------------
+
+def build_activity_resolver(config: dict, activities: list):
+    """Return resolve(project_id) -> activity_id. Prefers an activity scoped to
+    that project (one named 'General' if present), then the configured
+    default_activity_id, then a global 'General'/first global activity."""
+    by_project, globals_ = {}, []
+    for a in activities:
+        proj = a.get("project")
+        if proj:
+            by_project.setdefault(proj, []).append(a)
+        else:
+            globals_.append(a)
+
+    def _prefer_general(items):
+        for a in items:
+            if a.get("name", "").strip().lower() == "general":
+                return a["id"]
+        return items[0]["id"] if items else None
+
+    default_activity = config.get("default_activity_id")
+
+    def resolve(project_id):
+        scoped = by_project.get(project_id)
+        if scoped:
+            return _prefer_general(scoped)
+        if default_activity:
+            return default_activity
+        return _prefer_general(globals_)
+
+    return resolve
 
 
 def classify_and_save(config: dict, entries: list) -> dict:
@@ -202,9 +246,18 @@ def classify_and_save(config: dict, entries: list) -> dict:
         return mappings
 
     try:
-        projects = common.list_clockify_projects(config)
+        projects = common.list_kimai_projects(config)
+        resolve_activity = build_activity_resolver(config, common.list_kimai_activities(config))
         matches = classify_keys_with_claude(anthropic_key, unmapped, projects, mappings)
-        to_save = {key: pid for key, pid in matches.items() if pid}
+        to_save = {}
+        for key, pid in matches.items():
+            if not pid:
+                continue
+            activity_id = resolve_activity(pid)
+            if not activity_id:
+                log.warning(f"'{key}' → project {pid} but no activity resolvable — leaving unmapped")
+                continue
+            to_save[key] = {"project": pid, "activity": activity_id}
         if to_save:
             mappings.update(to_save)
             common.save_project_mappings(mappings)
@@ -263,13 +316,18 @@ def confirm_match(key: str, project: dict, projects: list, config: dict):
     return _resolve_or_create(answer, projects, config)
 
 
+def _customer_name(p: dict) -> str:
+    """Customer label for a Kimai project. The /projects collection exposes the
+    customer name as parentTitle; fall back gracefully."""
+    return p.get("parentTitle") or "No customer"
+
+
 def print_projects_by_client(projects: list):
-    """Print all Clockify projects grouped by client, one line per client."""
+    """Print all Kimai projects grouped by customer, one line per customer."""
     by_client = {}
     for p in projects:
-        client = p.get("clientName") or "No client"
-        by_client.setdefault(client, []).append(p["name"])
-    print("── Clockify projects ──────────────────────────")
+        by_client.setdefault(_customer_name(p), []).append(p["name"])
+    print("── Kimai projects ─────────────────────────────")
     for client in sorted(by_client):
         names = ",  ".join(sorted(by_client[client]))
         print(f"  {client}:  {names}")
@@ -279,20 +337,27 @@ def print_projects_by_client(projects: list):
 def _resolve_or_create(answer: str, projects: list, config: dict):
     """
     Try to fuzzy-match answer against existing projects.
-    If no match found, offer to create a new Clockify project with that name.
-    Returns the project dict or None.
+    If no match found, offer to create a new Kimai project with that name under
+    the configured default_customer_id (and a 'General' activity). Returns the
+    project dict or None.
     """
     found = fuzzy_find_project(answer, projects)
     if found:
         print(f"    Using: {found['name']}")
         return found
-    create = input(f"    No match for '{answer}'. Create new Clockify project? [y/n]: ").strip().lower()
+    customer_id = config.get("default_customer_id")
+    if not customer_id:
+        print(f"    No match for '{answer}', and no default_customer_id set in config.json — "
+              "create the project in Kimai first, then re-run.")
+        return None
+    create = input(f"    No match for '{answer}'. Create new Kimai project under customer {customer_id}? [y/n]: ").strip().lower()
     if create == "y":
         try:
-            new_project = common.create_clockify_project(config, answer)
+            new_project = common.create_kimai_project(config, answer, customer_id)
+            common.create_kimai_activity(config, "General", new_project["id"])
             projects.append(new_project)   # make it available for subsequent matches
             print(f"    Created: '{new_project['name']}'  ({new_project['id']})")
-            log.info(f"Created new Clockify project '{new_project['name']}' ({new_project['id']})")
+            log.info(f"Created new Kimai project '{new_project['name']}' ({new_project['id']})")
             return new_project
         except Exception as e:
             print(f"    ERROR creating project: {e}")
@@ -323,11 +388,12 @@ def cmd_match(days: int, dry_run: bool, interactive: bool):
 
     print(f"Found {len(unmapped)} unmapped activity key(s): {', '.join(unmapped)}\n")
 
-    print("Fetching Clockify projects...")
+    print("Fetching Kimai projects and activities...")
     try:
-        projects = common.list_clockify_projects(config)
+        projects = common.list_kimai_projects(config)
+        resolve_activity = build_activity_resolver(config, common.list_kimai_activities(config))
     except Exception as e:
-        print(f"ERROR: Could not fetch Clockify projects: {e}")
+        print(f"ERROR: Could not fetch Kimai projects: {e}")
         sys.exit(1)
 
     print_projects_by_client(projects)
@@ -373,8 +439,13 @@ def cmd_match(days: int, dry_run: bool, interactive: bool):
                 continue
 
             if result:
-                to_save[key] = result["id"]
-                log.info(f"Matched '{key}' → {result['name']} (interactive)")
+                activity_id = resolve_activity(result["id"])
+                if activity_id:
+                    to_save[key] = {"project": result["id"], "activity": activity_id}
+                    log.info(f"Matched '{key}' → {result['name']} (interactive)")
+                else:
+                    to_save.pop(key, None)
+                    print(f"    (no activity available for '{result['name']}' — skipped)")
             else:
                 to_save.pop(key, None)   # clear if re-answering
 
@@ -385,9 +456,14 @@ def cmd_match(days: int, dry_run: bool, interactive: bool):
         for key in keys:
             project_id = matches.get(key)
             if project_id and project_id in project_by_id:
-                to_save[key] = project_id
-                print(f"  {key}  →  {project_by_id[project_id]['name']}")
-                log.info(f"Matched '{key}' → {project_by_id[project_id]['name']}")
+                activity_id = resolve_activity(project_id)
+                if activity_id:
+                    to_save[key] = {"project": project_id, "activity": activity_id}
+                    print(f"  {key}  →  {project_by_id[project_id]['name']}")
+                    log.info(f"Matched '{key}' → {project_by_id[project_id]['name']}")
+                else:
+                    print(f"  {key}  →  {project_by_id[project_id]['name']} (no activity available — skipped)")
+                    null_count += 1
             else:
                 print(f"  {key}  →  (no confident match — will retry next run)")
                 null_count += 1
@@ -410,11 +486,12 @@ def cmd_link(key: str, project_name_query: str):
     """Fuzzy-link an activity key to a project by name. No Anthropic key needed."""
     config = common.load_config()
 
-    print("Fetching Clockify projects...")
+    print("Fetching Kimai projects and activities...")
     try:
-        projects = common.list_clockify_projects(config)
+        projects = common.list_kimai_projects(config)
+        resolve_activity = build_activity_resolver(config, common.list_kimai_activities(config))
     except Exception as e:
-        print(f"ERROR: Could not fetch Clockify projects: {e}")
+        print(f"ERROR: Could not fetch Kimai projects: {e}")
         sys.exit(1)
 
     found = fuzzy_find_project(project_name_query, projects)
@@ -422,14 +499,20 @@ def cmd_link(key: str, project_name_query: str):
         print(f"No project matched '{project_name_query}'.")
         print("\nAvailable projects:")
         for p in projects:
-            client = f"  [{p.get('clientName', '')}]" if p.get("clientName") else ""
+            client = f"  [{_customer_name(p)}]"
             print(f"  {p['name']}{client}")
         sys.exit(1)
 
+    activity_id = resolve_activity(found["id"])
+    if not activity_id:
+        print(f"'{found['name']}' has no usable activity (and no default_activity_id set) — "
+              "add an activity to it in Kimai first.")
+        sys.exit(1)
+
     mappings = common.load_project_mappings()
-    mappings[key] = found["id"]
+    mappings[key] = {"project": found["id"], "activity": activity_id}
     common.save_project_mappings(mappings)
-    print(f"Mapped '{key}'  →  {found['name']}  ({found['id']})")
+    print(f"Mapped '{key}'  →  {found['name']}  (project {found['id']}, activity {activity_id})")
     log.info(f"Linked '{key}' → {found['name']} via --link")
 
 

@@ -11,6 +11,13 @@ PLIST_DST="$HOME/Library/LaunchAgents/$PLIST_NAME.plist"
 echo "==> Setting up Timetracker"
 echo "    Project dir: $SCRIPT_DIR"
 
+# Lock down files holding credentials or captured activity (window titles, URLs)
+[ -f "$SCRIPT_DIR/config.json" ] && chmod 600 "$SCRIPT_DIR/config.json"
+[ -f "$SCRIPT_DIR/google_tokens.json" ] && chmod 600 "$SCRIPT_DIR/google_tokens.json"
+mkdir -p "$SCRIPT_DIR/logs"
+chmod 700 "$SCRIPT_DIR/logs"
+chmod 600 "$SCRIPT_DIR"/*.log 2>/dev/null || true
+
 # Write plist with correct absolute paths
 cat > "$PLIST_SRC" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

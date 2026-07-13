@@ -1,9 +1,11 @@
 # User credentials — never commit these
 config.json
 project_mappings.json
+google_tokens.json
 
 # Runtime state
 sent_dates.json
+synced_meetings.json
 tracker.log
 launchd_stdout.log
 launchd_stderr.log
