@@ -142,7 +142,7 @@ def _day_window_utc(date_str: str, config: dict):
 # Event fetching + filtering
 # ---------------------------------------------------------------------------
 
-def _list_events(access_token: str, time_min: str, time_max: str) -> list:
+def _list_events(access_token: str, time_min: str, time_max: str, calendar_id: str = "primary") -> list:
     events, page_token = [], None
     while True:
         params = {
@@ -155,7 +155,7 @@ def _list_events(access_token: str, time_min: str, time_max: str) -> list:
         }
         if page_token:
             params["pageToken"] = page_token
-        url = f"{CALENDAR_API}/calendars/primary/events?" + urllib.parse.urlencode(params)
+        url = f"{CALENDAR_API}/calendars/{urllib.parse.quote(calendar_id)}/events?" + urllib.parse.urlencode(params)
         data = _get_json(url, access_token)
         events.extend(data.get("items", []))
         page_token = data.get("nextPageToken")
@@ -192,38 +192,53 @@ def qualifying_meetings(config: dict, date_str: str) -> list:
         log.warning("Calendar sync enabled but no authorized accounts (run: calendar_sync.py --auth)")
         return []
 
+    # Besides each account's own primary calendar, optionally read specific
+    # shared calendars (config: extra_calendars, e.g. a personal Gmail whose
+    # calendar is shared into a work account). Fetched through every account's
+    # token; a calendar an account can't see just 404s and is skipped. Dedup by
+    # UID keeps a calendar visible to two accounts from being counted twice.
+    extra_calendars = config.get("extra_calendars") or []
     by_uid = {}
     for acct in tokens:
         try:
             token = _access_token(config, acct["refresh_token"])
-            events = _list_events(token, time_min, time_max)
         except Exception as e:
-            log.error(f"Failed to fetch events for {acct.get('email','?')}: {e}")
+            log.error(f"Failed to authorize {acct.get('email','?')}: {e}")
             continue
 
-        for ev in events:
-            if ev.get("status") == "cancelled":
+        for calendar_id in ("primary", *extra_calendars):
+            try:
+                events = _list_events(token, time_min, time_max, calendar_id)
+            except Exception as e:
+                if calendar_id == "primary":
+                    log.error(f"Failed to fetch events for {acct.get('email','?')}: {e}")
+                else:
+                    log.debug(f"{acct.get('email','?')} can't read calendar {calendar_id}: {e}")
                 continue
-            start, end = ev.get("start", {}), ev.get("end", {})
-            if "dateTime" not in start or "dateTime" not in end:
-                continue    # all-day / date-only event
-            if _self_declined(ev):
-                continue
-            guests = _external_guests(ev, owner_emails)
-            if not guests:
-                continue    # no external guest -> not in scope
 
-            uid = ev.get("iCalUID") or ev.get("id")
-            if uid in by_uid:
-                by_uid[uid]["guests"] = sorted(set(by_uid[uid]["guests"]) | set(guests))
-                continue
-            by_uid[uid] = {
-                "uid": uid,
-                "summary": ev.get("summary", "(no title)"),
-                "start": _parse_rfc3339(start["dateTime"]),
-                "end": _parse_rfc3339(end["dateTime"]),
-                "guests": guests,
-            }
+            for ev in events:
+                if ev.get("status") == "cancelled":
+                    continue
+                start, end = ev.get("start", {}), ev.get("end", {})
+                if "dateTime" not in start or "dateTime" not in end:
+                    continue    # all-day / date-only event
+                if _self_declined(ev):
+                    continue
+                guests = _external_guests(ev, owner_emails)
+                if not guests:
+                    continue    # no external guest -> not in scope
+
+                uid = ev.get("iCalUID") or ev.get("id")
+                if uid in by_uid:
+                    by_uid[uid]["guests"] = sorted(set(by_uid[uid]["guests"]) | set(guests))
+                    continue
+                by_uid[uid] = {
+                    "uid": uid,
+                    "summary": ev.get("summary", "(no title)"),
+                    "start": _parse_rfc3339(start["dateTime"]),
+                    "end": _parse_rfc3339(end["dateTime"]),
+                    "guests": guests,
+                }
 
     meetings = [m for m in by_uid.values() if m["end"] > m["start"]]
     meetings.sort(key=lambda m: m["start"])

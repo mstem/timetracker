@@ -13,6 +13,7 @@
   "google_oauth_client_id": "<optional — Google Cloud 'Desktop app' OAuth client id>",
   "google_oauth_client_secret": "<optional — matching OAuth client secret>",
   "owner_emails": ["you@example.com"],
+  "extra_calendars": [],
   "meetings_project_id": null,
   "meetings_activity_id": null,
 
