@@ -1,6 +1,6 @@
 # User credentials — never commit these
 config.json
-project_mappings.json
+project_mappings.json*
 google_tokens.json
 
 # Runtime state
@@ -20,6 +20,10 @@ com.terminaltracker.watchdog-health.plist
 ai_matcher.log
 ai_matcher_stdout.log
 ai_matcher_stderr.log
+
+# App bundle: keep Info.plist + launcher (source), ignore the local ad-hoc
+# signature (regenerated per-machine by setup.sh's codesign step)
+TimeTracker.app/Contents/_CodeSignature/
 
 # Python
 __pycache__/

@@ -61,21 +61,13 @@ See [Configuration reference](#configuration-reference) below for the rest of th
 
 > **Tip:** the [migration script](#migrating-from-clockify) prints ready-to-paste `default_*` and `meetings_*` ids after it mirrors your workspace, so you usually don't fill these in by hand.
 
-### 3. Grant Accessibility permission
-
-Tracking apps other than Terminal/Chrome works by asking `System Events` for the frontmost app's window name, which requires **Accessibility** permission:
-
-1. System Settings → Privacy & Security → Accessibility
-2. Grant access to whatever process ends up running `osascript` — in practice this is usually **Terminal.app** (if you run `python3 tracker.py` from a Terminal window) and/or **`/usr/bin/python3`** once it's running under launchd. macOS often prompts automatically the first time the script tries; if it doesn't, add the binary manually.
-3. Verify it worked: run `python3 tracker.py` in the foreground for a few seconds, switch to a non-Terminal, non-Chrome app, then check `tracker.log` — you should see `Activity focus: 'app:...'` lines, not `osascript system events error` ones.
-
-### 4. Install as a login item (auto-starts on login)
+### 3. Install as a login item (auto-starts on login)
 
 ```bash
 bash setup.sh
 ```
 
-This generates and loads a launchd agent. The tracker starts immediately and will restart automatically on login.
+This ad-hoc-signs `TimeTracker.app` (the bundle the tracker runs from) and generates + loads a launchd agent that launches it. The tracker starts immediately and will restart automatically on login.
 
 **Stop / start manually:**
 
@@ -83,6 +75,18 @@ This generates and loads a launchd agent. The tracker starts immediately and wil
 launchctl unload ~/Library/LaunchAgents/com.terminaltracker.plist
 launchctl load  ~/Library/LaunchAgents/com.terminaltracker.plist
 ```
+
+### 4. Grant Accessibility permission
+
+Capturing window titles (and tracking apps other than Terminal/Chrome) works by asking `System Events` for the frontmost app's window name, which requires **Accessibility** permission. Without it the probe silently returns *empty* titles — so every entry loses its label, the classifier can't match anything, and everything dumps into your default (Internal/Misc) bucket.
+
+The tracker runs from **`TimeTracker.app`** specifically so this grant sticks: a bare launchd `python3` process can't hold the Accessibility grant (TCC attributes the request to the CommandLineTools Python binary, which the grant won't persist on), whereas a signed app bundle can.
+
+1. System Settings → Privacy & Security → Accessibility
+2. Click **+** and add **`TimeTracker.app`** from the project directory (in the file dialog, ⌘⇧G lets you paste the path). Toggle it **on**. Remove any older `python3`/`Python`/`Terminal` entry you may have added — that's the wrong identity now.
+3. Verify: switch to a non-Terminal, non-Chrome app for a few seconds, then check the newest entry in `logs/<today>.json` — its `window` field should be a real title, not `""`.
+
+> The bundle references `tracker.py` by absolute path, so editing `tracker.py` doesn't change the bundle's signature and the grant survives code changes. Re-running `setup.sh` re-signs with the same identifier, so the grant also survives reinstalls.
 
 ## Usage
 
@@ -345,7 +349,8 @@ timetracker/
 ├── notify_telegram.sh         # shared Telegram-send helper
 ├── watchdog_process.sh        # alerts if the tracker daemon isn't running
 ├── watchdog_health.sh         # alerts if today's log has gone stale
-├── setup.sh                   # installs the launchd agents
+├── setup.sh                   # signs the app bundle + installs the launchd agents
+├── TimeTracker.app/           # signed bundle the tracker runs from (holds the Accessibility grant)
 ├── config.example.json        # template — copy to config.json and fill in
 └── logs/                      # daily JSON logs (auto-created, gitignored)
 ```

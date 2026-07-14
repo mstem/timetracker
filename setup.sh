@@ -7,9 +7,20 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PLIST_NAME="com.terminaltracker"
 PLIST_SRC="$SCRIPT_DIR/$PLIST_NAME.plist"
 PLIST_DST="$HOME/Library/LaunchAgents/$PLIST_NAME.plist"
+APP_BUNDLE="$SCRIPT_DIR/TimeTracker.app"
+APP_EXEC="$APP_BUNDLE/Contents/MacOS/TimeTracker"
 
 echo "==> Setting up Timetracker"
 echo "    Project dir: $SCRIPT_DIR"
+
+# The tracker runs from inside TimeTracker.app so macOS Accessibility (TCC) can
+# be granted to a stable app-bundle identity — a bare launchd python process
+# can't hold the grant, and window-title capture silently returns empty without
+# it. The bundle's Info.plist + launcher are checked into the repo; here we just
+# make the launcher executable and (re)ad-hoc-sign so the grant persists.
+chmod +x "$APP_EXEC"
+codesign --force --sign - --identifier "$PLIST_NAME" "$APP_BUNDLE"
+echo "==> Signed $APP_BUNDLE"
 
 # Lock down files holding credentials or captured activity (window titles, URLs)
 [ -f "$SCRIPT_DIR/config.json" ] && chmod 600 "$SCRIPT_DIR/config.json"
@@ -28,8 +39,7 @@ cat > "$PLIST_SRC" <<EOF
     <string>$PLIST_NAME</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
-        <string>$SCRIPT_DIR/tracker.py</string>
+        <string>$APP_EXEC</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -55,6 +65,12 @@ launchctl unload "$PLIST_DST" 2>/dev/null || true
 # Load
 launchctl load "$PLIST_DST"
 echo "==> Loaded launchd agent — tracker is now running."
+echo ""
+echo "⚠  ONE-TIME MANUAL STEP: grant Accessibility to the app so window-title"
+echo "   capture works. System Settings → Privacy & Security → Accessibility →"
+echo "   + → add:  $APP_BUNDLE"
+echo "   (remove any older python3/Python entry — it's the wrong identity.)"
+echo "   Without this, entries are captured with empty titles and dump to Misc."
 echo ""
 echo "Useful commands:"
 echo "  Stop:    launchctl unload ~/Library/LaunchAgents/$PLIST_NAME.plist"

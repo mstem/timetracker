@@ -1,0 +1,26 @@
+#!/bin/bash
+# CFBundleExecutable for TimeTracker.app.
+#
+# Purpose: give the activity tracker a stable *app-bundle* identity so macOS
+# Accessibility (TCC) can be granted to it reliably. A bare launchd python
+# process can't hold the Accessibility grant (TCC attributes the osascript
+# window-title probe to the CommandLineTools Python binary, which the grant
+# won't stick to) — so window titles came back empty. Wrapping the tracker in
+# this signed bundle and granting Accessibility to TimeTracker.app fixes that.
+#
+# tracker.py runs as a CHILD here (not via exec) on purpose: this bundle
+# process must stay alive as the TCC-responsible parent for the osascript
+# calls tracker.py spawns. exec-ing python would replace this process with
+# Python's own code identity and defeat the whole point.
+#
+# SIGTERM/SIGINT are forwarded to python so tracker.py's shutdown handler still
+# runs (it flushes the in-progress activity before exit). The double `wait`
+# blocks until python has actually finished flushing.
+
+DIR="/Users/home/Projects/timetracker"
+
+/usr/bin/python3 "$DIR/tracker.py" &
+PID=$!
+trap 'kill -TERM "$PID" 2>/dev/null' TERM INT
+wait "$PID"   # interrupted when the trap fires on SIGTERM
+wait "$PID"   # block until python has actually exited (post-flush)
