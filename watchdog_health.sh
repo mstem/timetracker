@@ -27,6 +27,20 @@ LAST_MODIFIED=$(stat -f %m "$TODAY_LOG")
 NOW=$(date +%s)
 AGE_MIN=$(( (NOW - LAST_MODIFIED) / 60 ))
 
+# The tracker can't log while the machine is asleep, and launchd runs the whole
+# missed schedule the moment it wakes — so an overnight sleep looks exactly like
+# a stuck tracker. Only count time the machine was actually awake.
+LAST_WAKE=$(pmset -g log 2>/dev/null | awk '$4 == "Wake" {ts = $1 " " $2} END {print ts}')
+if [ -n "$LAST_WAKE" ]; then
+  WAKE_TS=$(date -j -f "%Y-%m-%d %H:%M:%S" "$LAST_WAKE" +%s 2>/dev/null)
+  if [ -n "$WAKE_TS" ]; then
+    AWAKE_MIN=$(( (NOW - WAKE_TS) / 60 ))
+    if [ "$AWAKE_MIN" -lt "$AGE_MIN" ]; then
+      AGE_MIN=$AWAKE_MIN
+    fi
+  fi
+fi
+
 if [ "$AGE_MIN" -gt 90 ]; then
   "$DIR/notify_telegram.sh" "🟡 Timetracker: today's log hasn't updated in ${AGE_MIN} minutes. It may be stuck (e.g. lost Accessibility/AppleScript permission)."
 fi

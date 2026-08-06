@@ -41,6 +41,7 @@ LOG_FILE = os.path.join(BASE_DIR, "tracker.log")
 POLL_INTERVAL = 2  # seconds
 MIN_ENTRY_SECONDS = 5  # hardcoded final floor when aggregating for send — not a tuning knob
 KIMAI_CHECK_INTERVAL = 60  # seconds between Kimai active-timesheet API checks
+MISSED_RETRY_INTERVAL = 3600  # seconds between re-sweeps for days that failed to send
 
 logging.basicConfig(
     filename=LOG_FILE,
@@ -342,10 +343,14 @@ def _sync_meetings(config: dict, date_str: str) -> list:
         return []
 
 
-def send_to_kimai(config: dict, date_str: str, entries: list) -> int:
+def send_to_kimai(config: dict, date_str: str, entries: list) -> tuple:
     """Sync external calendar meetings, then classify newly-seen activity and
     send aggregated daily tracker entries to Kimai (minus any time already
-    covered by a synced meeting)."""
+    covered by a synced meeting).
+
+    Returns (sent, failed). Per-entry errors are caught so one bad group can't
+    abort the rest, so callers must check `failed` before marking the day sent —
+    an exception never reaches them."""
     meetings = _sync_meetings(config, date_str)
     entries = subtract_meetings(entries, meetings)
 
@@ -354,6 +359,7 @@ def send_to_kimai(config: dict, date_str: str, entries: list) -> int:
     default_project = config.get("default_project_id")
     default_activity = config.get("default_activity_id")
     sent = 0
+    failed = 0
     for key, data in groups.items():
         if data["seconds"] < MIN_ENTRY_SECONDS:
             log.info(f"Skipping '{key}' ({data['seconds']}s, under minimum)")
@@ -393,11 +399,13 @@ def send_to_kimai(config: dict, date_str: str, entries: list) -> int:
             err_body = e.read().decode()
             log.error(f"Kimai HTTP {e.code} for '{key}': {err_body}")
             print(f"  ✗ '{description}' — HTTP {e.code}: {err_body}")
+            failed += 1
         except Exception as e:
             log.error(f"Kimai error for '{key}': {e}")
             print(f"  ✗ '{description}' — {e}")
+            failed += 1
 
-    return sent
+    return sent, failed
 
 
 # ---------------------------------------------------------------------------
@@ -430,12 +438,13 @@ def cmd_send(date_str: str):
         print(f"No log found for {date_str}")
         return
     print(f"Sending {len(entries)} raw entries for {date_str}...")
-    sent = send_to_kimai(config, date_str, entries)
-    if sent:
+    sent, failed = send_to_kimai(config, date_str, entries)
+    if failed:
+        print(f"Done — {sent} entries sent, {failed} failed. "
+              f"{date_str} left unsent so it retries later.")
+    else:
         mark_date_sent(date_str)
         print(f"Done — {sent} entries sent.")
-    else:
-        print("Nothing sent (all entries under the minimum duration or errors).")
 
 
 # ---------------------------------------------------------------------------
@@ -505,11 +514,13 @@ class Tracker:
             entries = load_entries(path)
             if entries:
                 try:
-                    send_to_kimai(self.config, yesterday, entries)
-                    mark_date_sent(yesterday)
-                    self.sent_dates.add(yesterday)
+                    sent, failed = send_to_kimai(self.config, yesterday, entries)
+                    self._settle_send(yesterday, sent, failed)
                 except Exception as e:
                     log.error(f"Failed to send {yesterday}: {e}")
+        # Always advance the date, even if the send failed — otherwise the
+        # rollover re-fires on every poll. Unsent days are retried by
+        # _send_missed_days instead.
         self.current_date = today
 
     def _on_shutdown(self, signum, frame):
@@ -522,10 +533,18 @@ class Tracker:
         log.info("Tracker started.")
         # On startup, send any unsent past days
         self._send_missed_days()
+        last_retry = datetime.datetime.utcnow()
 
         while True:
             now = datetime.datetime.utcnow()
             self._check_midnight()
+
+            # The midnight send often lands before the network is back after a
+            # wake. Re-sweep periodically so a failed day doesn't sit unsent
+            # until the next daemon restart.
+            if (now - last_retry).total_seconds() >= MISSED_RETRY_INTERVAL:
+                last_retry = now
+                self._send_missed_days()
             timer_running = self._has_kimai_active_timer()
 
             if timer_running:
@@ -588,11 +607,31 @@ class Tracker:
             entries = load_entries(path)
             if entries:
                 try:
-                    send_to_kimai(self.config, date_str, entries)
-                    mark_date_sent(date_str)
-                    self.sent_dates.add(date_str)
+                    sent, failed = send_to_kimai(self.config, date_str, entries)
+                    self._settle_send(date_str, sent, failed)
                 except Exception as e:
                     log.error(f"Failed to send missed day {date_str}: {e}")
+
+    def _settle_send(self, date_str: str, sent: int, failed: int) -> bool:
+        """Decide whether a send counts as done. Returns True if the day was
+        marked sent.
+
+        A day is only left unsent when *nothing* got through — the network-down
+        case, which is safe to retry wholesale. A partial failure is marked sent
+        anyway: re-sending would duplicate the entries that did land, so the
+        stragglers are logged for manual entry instead."""
+        if failed and not sent:
+            log.warning(f"{date_str}: all {failed} entries failed to send — will retry")
+            return False
+        if failed:
+            log.error(
+                f"{date_str}: {sent} sent but {failed} failed. Marking sent to avoid "
+                f"duplicating the {sent} that landed — add the failures manually "
+                f"(see the 'Kimai' errors above)."
+            )
+        mark_date_sent(date_str)
+        self.sent_dates.add(date_str)
+        return True
 
 
 # ---------------------------------------------------------------------------

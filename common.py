@@ -96,6 +96,9 @@ def require_anthropic_key(config: dict):
 # Kimai
 # ---------------------------------------------------------------------------
 
+KIMAI_USER_AGENT = "timetracker/1.0 (+https://github.com/civictechguide/timetracker)"
+
+
 def kimai_request(config: dict, method: str, path: str, body: dict = None):
     """Call the Kimai REST API. Auth is a Bearer API token (Kimai 2.x).
 
@@ -107,6 +110,9 @@ def kimai_request(config: dict, method: str, path: str, body: dict = None):
         "Authorization": f"Bearer {config['kimai_token']}",
         "Content-Type": "application/json",
         "Accept": "application/json",
+        # Cloudflare in front of Kimai rejects urllib's default UA outright
+        # (error 1010, browser_signature_banned). Identify ourselves instead.
+        "User-Agent": KIMAI_USER_AGENT,
     }
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
