@@ -27,6 +27,7 @@
   "video_apps": ["zoom.us", "FaceTime", "QuickTime Player", "VLC"],
   "video_domains": ["youtube.com", "netflix.com", "vimeo.com", "twitch.tv", "meet.google.com", "zoom.us"],
   "idle_threshold_seconds": 600,
+  "video_idle_threshold_seconds": 7200,
   "min_duration_seconds": {"terminal": 1, "chrome": 60, "app": 60},
   "generic_domains": ["accounts.google.com", "myaccount.google.com", "login.microsoftonline.com", "okta.com"]
 }

@@ -42,6 +42,7 @@ POLL_INTERVAL = 2  # seconds
 MIN_ENTRY_SECONDS = 5  # hardcoded final floor when aggregating for send — not a tuning knob
 KIMAI_CHECK_INTERVAL = 60  # seconds between Kimai active-timesheet API checks
 MISSED_RETRY_INTERVAL = 3600  # seconds between re-sweeps for days that failed to send
+SLEEP_GAP_SECONDS = 60  # a gap this long between 2s polls means the process wasn't running
 
 logging.basicConfig(
     filename=LOG_FILE,
@@ -459,6 +460,7 @@ class Tracker:
         self.current_activity: ActivityState | None = None
         self.activity_start: datetime.datetime | None = None
         self.is_idle: bool = False
+        self._idle_probe_failing: bool = False
         self.current_date = datetime.date.today()
         self.sent_dates = load_sent_dates()
 
@@ -502,6 +504,56 @@ class Tracker:
         self._kimai_last_check = now
         return self._kimai_active_cache
 
+    def _idle_close_point(self, now: datetime.datetime, idle_seconds: float,
+                          in_video: bool) -> datetime.datetime:
+        """When to end a session that just went idle.
+
+        Normally that's the moment input actually stopped, not the moment idle
+        crossed the threshold — the gap in between isn't work. Video is the
+        exception: silence is how watching looks, so the whole stretch counts
+        and the threshold acts purely as a ceiling.
+        """
+        idle_since = now if in_video else now - datetime.timedelta(seconds=idle_seconds)
+        if self.activity_start and idle_since < self.activity_start:
+            idle_since = self.activity_start
+        return idle_since
+
+    def _idle_probe_warn(self):
+        """Log the first idle-probe failure, then stay quiet — the loop polls
+        every POLL_INTERVAL seconds and would otherwise flood the log."""
+        if not self._idle_probe_failing:
+            log.warning("Idle probe (ioreg) unreadable — capture paused until it recovers")
+            self._idle_probe_failing = True
+
+    def _idle_probe_ok(self):
+        if self._idle_probe_failing:
+            log.info("Idle probe recovered — capture resumed")
+            self._idle_probe_failing = False
+
+    def _gap_check(self, now: datetime.datetime, last_tick: datetime.datetime):
+        """Close out the current session if the clock jumped since the last poll.
+
+        The loop ticks every POLL_INTERVAL seconds, so a gap of minutes means the
+        process wasn't running — almost always because the machine slept. Idle
+        detection can't catch this: HIDIdleTime resets when a keypress wakes the
+        machine, so on the next tick the user looks active and the frontmost app
+        is unchanged, and the whole sleep window gets billed to that app. Bill
+        only up to the last tick we actually observed.
+        """
+        gap = (now - last_tick).total_seconds()
+        if gap < SLEEP_GAP_SECONDS:
+            return
+        if self.current_activity:
+            log.info(
+                f"Clock jumped {gap / 60:.0f}m (machine asleep?) — closed "
+                f"'{self.current_activity.key}' at {last_tick.isoformat()}"
+            )
+            self._flush_current(last_tick)
+        else:
+            log.info(f"Clock jumped {gap / 60:.0f}m (machine asleep?)")
+        # Treat the wake as a fresh start rather than a continuation.
+        self.is_idle = True
+
     def _check_midnight(self):
         today = datetime.date.today()
         if today == self.current_date:
@@ -534,9 +586,12 @@ class Tracker:
         # On startup, send any unsent past days
         self._send_missed_days()
         last_retry = datetime.datetime.utcnow()
+        last_tick = datetime.datetime.utcnow()
 
         while True:
             now = datetime.datetime.utcnow()
+            self._gap_check(now, last_tick)
+            last_tick = now
             self._check_midnight()
 
             # The midnight send often lands before the network is back after a
@@ -556,18 +611,32 @@ class Tracker:
 
             idle_threshold = self.config.get("idle_threshold_seconds", common.DEFAULT_IDLE_THRESHOLD_SECONDS)
             idle_seconds = common.get_idle_seconds()
+            if idle_seconds is None:
+                # Idle state unknown — bank what we have rather than guess the
+                # user is still here. Mirrors the get_frontmost probe pause.
+                if self.current_activity:
+                    self._idle_probe_warn()
+                    self._flush_current(now)
+                time.sleep(POLL_INTERVAL)
+                continue
+            self._idle_probe_ok()
+
             in_video = self.current_activity is not None and common.is_video_context(
                 self.current_activity.source, self.current_activity.app,
                 self.current_activity.url, self.config,
             )
 
-            if idle_seconds >= idle_threshold and not in_video:
+            if in_video:
+                # Video gets a much longer leash than normal input-driven work,
+                # but not an unlimited one — see DEFAULT_VIDEO_IDLE_THRESHOLD_SECONDS.
+                idle_threshold = self.config.get(
+                    "video_idle_threshold_seconds",
+                    common.DEFAULT_VIDEO_IDLE_THRESHOLD_SECONDS,
+                )
+
+            if idle_seconds >= idle_threshold:
                 if not self.is_idle:
-                    # Close out the session at the moment input actually stopped,
-                    # not at the moment idle crossed the threshold.
-                    idle_since = now - datetime.timedelta(seconds=idle_seconds)
-                    if self.activity_start and idle_since < self.activity_start:
-                        idle_since = self.activity_start
+                    idle_since = self._idle_close_point(now, idle_seconds, in_video)
                     self._flush_current(idle_since)
                     self.is_idle = True
                     log.info(f"Idle for {idle_seconds:.0f}s — closed session at {idle_since.isoformat()}")

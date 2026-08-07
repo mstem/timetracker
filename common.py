@@ -45,6 +45,10 @@ DEFAULT_VIDEO_DOMAINS = [
     "youtube.com", "netflix.com", "vimeo.com", "twitch.tv", "meet.google.com", "zoom.us",
 ]
 DEFAULT_IDLE_THRESHOLD_SECONDS = 600
+# Video playback legitimately produces no HID input, so the normal idle
+# threshold would cut a film short. But the bypass needs a ceiling: an
+# unbounded one bills a movie left running overnight as 14h of work.
+DEFAULT_VIDEO_IDLE_THRESHOLD_SECONDS = 7200
 DEFAULT_MIN_DURATION_SECONDS = {"terminal": 1, "chrome": 60, "app": 60}
 
 # Domains that are pure auth infrastructure — a sign-in flow never carries
@@ -342,18 +346,26 @@ def is_generic_domain(domain: str, config: dict) -> bool:
 # Idle detection
 # ---------------------------------------------------------------------------
 
-def get_idle_seconds() -> float:
-    """Seconds since the last HID (mouse/keyboard) event. Fails open (0.0) on error."""
+def get_idle_seconds():
+    """Seconds since the last HID (mouse/keyboard) event, or None if unreadable.
+
+    None means "can't tell", not "not idle" — returning 0.0 on failure used to
+    read as active input and kept billing time to the frontmost app while ioreg
+    was timing out.
+    """
     try:
         out = subprocess.run(
             ["ioreg", "-c", "IOHIDSystem"],
             capture_output=True, text=True, timeout=3,
         ).stdout
         m = re.search(r'"HIDIdleTime"\s*=\s*(\d+)', out)
-        return int(m.group(1)) / 1_000_000_000 if m else 0.0
+        if not m:
+            log.debug("ioreg returned no HIDIdleTime")
+            return None
+        return int(m.group(1)) / 1_000_000_000
     except Exception as e:
         log.debug(f"ioreg idle-time read failed: {e}")
-        return 0.0
+        return None
 
 
 # ---------------------------------------------------------------------------
