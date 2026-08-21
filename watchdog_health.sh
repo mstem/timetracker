@@ -41,6 +41,16 @@ if [ -n "$LAST_WAKE" ]; then
   fi
 fi
 
+# Same problem for idle time while awake: since the tracker stopped billing
+# idle, a long stretch away from the keyboard writes nothing to the log and
+# looks exactly like a stuck tracker. Discount however long input has been idle.
+IDLE_SEC=$(ioreg -c IOHIDSystem 2>/dev/null | awk '/HIDIdleTime/ {print int($NF/1000000000); exit}')
+if [ -n "$IDLE_SEC" ]; then
+  IDLE_MIN=$(( IDLE_SEC / 60 ))
+  AGE_MIN=$(( AGE_MIN - IDLE_MIN ))
+  [ "$AGE_MIN" -lt 0 ] && AGE_MIN=0
+fi
+
 if [ "$AGE_MIN" -gt 90 ]; then
   "$DIR/notify_telegram.sh" "🟡 Timetracker: today's log hasn't updated in ${AGE_MIN} minutes. It may be stuck (e.g. lost Accessibility/AppleScript permission)."
 fi
