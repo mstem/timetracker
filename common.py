@@ -30,6 +30,11 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 MAPPINGS_PATH = os.path.join(BASE_DIR, "project_mappings.json")
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
+# Phone samples live in their own directory: the tracker daemon does an
+# unlocked read-modify-write of logs/<date>.json every 2s, so a second
+# writer sharing that file would silently truncate Mac spans.
+ANDROID_LOGS_DIR = os.path.join(LOGS_DIR, "android")
+ANDROID_CATEGORIES_PATH = os.path.join(BASE_DIR, "android_categories.json")
 
 DEFAULT_KIMAI_TIMEZONE = "UTC"
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
@@ -49,7 +54,7 @@ DEFAULT_IDLE_THRESHOLD_SECONDS = 600
 # threshold would cut a film short. But the bypass needs a ceiling: an
 # unbounded one bills a movie left running overnight as 14h of work.
 DEFAULT_VIDEO_IDLE_THRESHOLD_SECONDS = 7200
-DEFAULT_MIN_DURATION_SECONDS = {"terminal": 1, "chrome": 60, "app": 60}
+DEFAULT_MIN_DURATION_SECONDS = {"terminal": 1, "chrome": 60, "app": 60, "android": 120}
 
 # Domains that are pure auth infrastructure — a sign-in flow never carries
 # project signal regardless of title — so these are never sent to Claude for
@@ -161,6 +166,23 @@ def create_kimai_activity(config: dict, name: str, project_id=None) -> dict:
     return kimai_request(config, "POST", "/activities", body)
 
 
+def ensure_kimai_tag(config: dict, name: str):
+    """Make sure a timesheet tag exists.
+
+    Kimai silently drops a `tags` value naming a tag it doesn't know, so a
+    POST /timesheets carrying an unknown tag succeeds with no tag attached and
+    no error. Creating it first is the only way the tag sticks. Re-creating an
+    existing tag is harmless. Note the tags API on this Kimai version has no
+    PATCH and no GET-by-id, and new tags come back visible=false while
+    GET /tags lists only visible ones, so the tag cannot be looked up or made
+    visible through the API — it works for tagging regardless.
+    """
+    try:
+        kimai_request(config, "POST", "/tags", {"name": name})
+    except Exception as e:
+        log.debug(f"ensure_kimai_tag({name!r}): {e}")
+
+
 def kimai_active_timesheet(config: dict) -> list:
     """Return the user's currently-running timesheets (empty if none)."""
     return kimai_request(config, "GET", "/timesheets/active") or []
@@ -172,6 +194,29 @@ def kimai_active_timesheet(config: dict) -> list:
 
 def kimai_timezone(config: dict) -> str:
     return config.get("kimai_timezone") or DEFAULT_KIMAI_TIMEZONE
+
+
+def check_kimai_timezone(config: dict):
+    """Warn when `kimai_timezone` disagrees with the Kimai user's own timezone.
+
+    Kimai stores timesheet begin/end as naive local wall-clock time and reads it
+    back in the *user's* configured zone, so a mismatch here silently shifts
+    every entry by the offset between the two with no error anywhere. This went
+    unnoticed for months with config on America/New_York and the Kimai user on
+    Europe/Lisbon, putting every entry 5 hours early.
+    """
+    configured = kimai_timezone(config)
+    try:
+        actual = (kimai_request(config, "GET", "/users/me") or {}).get("timezone")
+    except Exception as e:
+        log.debug(f"Could not read the Kimai user timezone: {e}")
+        return
+    if actual and actual != configured:
+        log.error(
+            f"kimai_timezone is {configured!r} but the Kimai user's timezone is "
+            f"{actual!r} — every entry sent will be shifted by the offset between "
+            f"them. Set kimai_timezone to {actual!r} in config.json."
+        )
 
 
 def kimai_local_time(dt_utc: datetime.datetime, config: dict) -> str:
@@ -234,6 +279,30 @@ def window_dir(window_name: str) -> str:
     return window_name.split(" — ")[0].strip()
 
 
+def path_key(path: str) -> str:
+    """Turn a shell working directory into a stable project-level mapping key.
+
+    iTerm2 reports a real cwd rather than a title, so the key comes from the
+    path instead of from window text. Everything under ~/Projects collapses to
+    its project root, so ~/Projects/foo/src and ~/Projects/foo/tests both land
+    on `~/projects/foo` instead of splintering into a key per subdirectory.
+
+    The `~/projects/<name>` shape matches the keys already in
+    project_mappings.json, so existing mappings keep working.
+    """
+    if not path:
+        return ""
+    path = path.strip()
+    home = os.path.expanduser("~")
+    if path.startswith(home):
+        path = "~" + path[len(home):]
+    parts = [p for p in path.split("/") if p]
+    # parts[0] == "~" for anything under the home directory
+    if len(parts) >= 3 and parts[0] == "~" and parts[1].lower() == "projects":
+        parts = parts[:3]
+    return normalize_key("/".join(parts))
+
+
 def normalize_key(key: str) -> str:
     """
     Canonicalize a mapping/aggregation key so case-only variants (e.g. a
@@ -274,12 +343,22 @@ def strip_url_params(url: str) -> str:
     return urlparse(url)._replace(query="", fragment="").geturl()
 
 
-def activity_key(source: str, window: str, url: str = None, app: str = None) -> str:
-    """Compute the mapping/aggregation key for a captured activity."""
+def activity_key(source: str, window: str, url: str = None, app: str = None,
+                 path: str = None) -> str:
+    """Compute the mapping/aggregation key for a captured activity.
+
+    `path` is the shell's working directory, available from iTerm2 but not from
+    Terminal.app. When present it wins: it is the real answer, where a window
+    title is a guess that Claude Code overwrites with its own status text.
+    """
     if source == "terminal":
-        key = window_dir(window)
+        key = path_key(path) if path else window_dir(window)
     elif source == "chrome":
         key = f"chrome:{chrome_domain(url)}"
+    elif source == "android":
+        # Deliberately its own namespace, not "app:": phone Gmail and desktop
+        # Gmail are different activities and may bill to different projects.
+        key = f"android:{app}"
     else:
         key = f"app:{app}"
     return normalize_key(key)
