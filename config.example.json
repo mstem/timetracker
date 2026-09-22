@@ -6,6 +6,7 @@
   "default_project_id": null,
   "default_activity_id": null,
   "default_customer_id": null,
+  "excluded_project_ids": [],
 
   "anthropic_api_key": "<optional — enables AI-powered project classification via ai_matcher.py>",
 
@@ -22,12 +23,23 @@
 
   "telegram_bot_token": "<optional — enables Telegram reminders and watchdog alerts>",
   "telegram_chat_id": "<your Telegram chat ID, from https://api.telegram.org/bot<token>/getUpdates>",
+
+  "android_sync_enabled": false,
+  "rescuetime_api_key": "<optional — enables Android tracking, from https://www.rescuetime.com/rtx/settings/api/key_management (Data API key, leave 'Allow queries from' blank)>",
+  "rescuetime_timezone": "<the timezone set in your RescueTime account, e.g. Europe/Lisbon. Required when android_sync_enabled is true. Not the same setting as kimai_timezone>",
+  "android_sync_delay_minutes": 45,
+
+  "exist_attribute_name": "<exist.io attribute name, from exist_sync.py --setup>",
+  "exist_dinner_gap_minutes": 60,
+  "exist_earliest_stop_hour": 15,
+  "exist_padding_minutes": 5,
+
   "blocked_apps": [],
   "blocked_domains": [],
   "video_apps": ["zoom.us", "FaceTime", "QuickTime Player", "VLC"],
   "video_domains": ["youtube.com", "netflix.com", "vimeo.com", "twitch.tv", "meet.google.com", "zoom.us"],
   "idle_threshold_seconds": 600,
   "video_idle_threshold_seconds": 7200,
-  "min_duration_seconds": {"terminal": 1, "chrome": 60, "app": 60},
+  "min_duration_seconds": {"terminal": 1, "chrome": 60, "app": 60, "android": 120},
   "generic_domains": ["accounts.google.com", "myaccount.google.com", "login.microsoftonline.com", "okta.com"]
 }

@@ -59,7 +59,9 @@ def collect_unmapped_keys_from_entries(entries: list, mappings: dict, config: di
         if key.startswith("chrome:"):
             if common.is_generic_domain(key[len("chrome:"):], config):
                 continue
-        elif not key.startswith("app:") and common.is_noise_dirname(key):
+        elif not key.startswith(("app:", "android:")) and common.is_noise_dirname(key):
+            # The dirname noise check only makes sense for working-directory
+            # keys; an app or phone-app name is never a shell artifact.
             continue
         titles = unmapped.setdefault(key, [])
         title = e.get("window", key)
@@ -78,14 +80,17 @@ def collect_unmapped_keys(days: int, mappings: dict, config: dict) -> dict:
 
     for i in range(1, days + 1):          # never include today's partial log
         date = today - datetime.timedelta(days=i)
-        path = os.path.join(common.LOGS_DIR, f"{date.isoformat()}.json")
-        if not os.path.exists(path):
-            continue
-        try:
-            with open(path) as f:
-                entries = json.load(f)
-        except Exception as exc:
-            log.warning(f"Could not read {path}: {exc}")
+        entries = []
+        for path in (os.path.join(common.LOGS_DIR, f"{date.isoformat()}.json"),
+                     os.path.join(common.ANDROID_LOGS_DIR, f"{date.isoformat()}.json")):
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path) as f:
+                    entries += json.load(f)
+            except Exception as exc:
+                log.warning(f"Could not read {path}: {exc}")
+        if not entries:
             continue
         for key, titles in collect_unmapped_keys_from_entries(entries, mappings, config).items():
             existing = merged.setdefault(key, [])
@@ -100,6 +105,17 @@ def collect_unmapped_keys(days: int, mappings: dict, config: dict) -> dict:
 # Anthropic / Claude
 # ---------------------------------------------------------------------------
 
+def config_excluded_project_ids() -> list:
+    """Kimai project ids the matcher must never propose (archived work).
+
+    Configured as `excluded_project_ids` in config.json.
+    """
+    try:
+        return common.load_config().get("excluded_project_ids", []) or []
+    except Exception:
+        return []
+
+
 def classify_keys_with_claude(api_key: str, unmapped: dict, projects: list, mappings: dict = None) -> dict:
     """
     Send all unmapped activity keys (with sample titles for context) + all
@@ -110,8 +126,32 @@ def classify_keys_with_claude(api_key: str, unmapped: dict, projects: list, mapp
     "specific enough to map" looks like in this user's own data, rather than
     guessing from the project list alone.
     """
-    project_map = {p["name"]: p["id"] for p in projects}
-    project_by_id = {p["id"]: p["name"] for p in projects}
+    # Exclude archived projects. They stay visible in Kimai for historical
+    # reporting, but offering them as candidates means old work keeps attracting
+    # new entries. "Urban League / General" collected 83 hours this way.
+    # Kimai project ids are ints; config.json is hand-edited and may hold them
+    # as strings, in which case an uncoerced `in` test quietly matches nothing
+    # and the guard does the opposite of its job.
+    excluded = set()
+    for i in config_excluded_project_ids():
+        try:
+            excluded.add(int(i))
+        except (TypeError, ValueError):
+            log.warning(f"excluded_project_ids: ignoring non-numeric entry {i!r}")
+    if excluded:
+        skipped = [p["name"] for p in projects if p["id"] in excluded]
+        projects = [p for p in projects if p["id"] not in excluded]
+        if skipped:
+            log.info(f"Excluding archived projects from matching: {', '.join(skipped)}")
+
+    # Label projects "Customer / Project", not bare project names. A project
+    # called "General" reads as a catch-all on its own; "Urban League / General"
+    # reads as what it is, work for one specific client.
+    def label(p):
+        return f"{_customer_name(p)} / {p['name']}"
+
+    project_map = {label(p): p["id"] for p in projects}
+    project_by_id = {p["id"]: label(p) for p in projects}
 
     examples_block = ""
     if mappings:
@@ -129,11 +169,16 @@ def classify_keys_with_claude(api_key: str, unmapped: dict, projects: list, mapp
 
     system = (
         "You are a project-matching assistant for a personal time tracker. "
-        "Map activity keys to Kimai project IDs. Activity keys come in three "
-        "forms: a bare directory name (from a macOS Terminal window title), "
-        "'chrome:<domain>' (a Chrome tab's domain), or 'app:<AppName>' (any other "
-        "application's name). Use the sample window/tab titles given for each key "
-        "as context for what the user was actually doing. "
+        "Map activity keys to Kimai project IDs. Activity keys come in four "
+        "forms: a working directory ('~/projects/foo' from iTerm2, or a bare "
+        "directory name from a macOS Terminal window title), "
+        "'chrome:<domain>' (a Chrome tab's domain), 'app:<AppName>' (any other "
+        "desktop application's name), or 'android:<app>' (an app used on the "
+        "phone, sometimes a raw package name like 'co.hinge.app'). Use the sample "
+        "window/tab titles given for each key as context for what the user was "
+        "actually doing. An 'android:' key has no title and no URL behind it, only "
+        "the app name, so it carries much weaker signal than the other forms: "
+        "return null unless the app exists for exactly one project. "
         "Reply ONLY with valid JSON. No markdown, no explanation, no code fences."
     )
 
@@ -141,7 +186,7 @@ def classify_keys_with_claude(api_key: str, unmapped: dict, projects: list, mapp
         "Match each activity key to the most appropriate Kimai project.\n"
         f"{examples_block}\n"
         f"Activity keys to match, with sample titles seen for each:\n{json.dumps(unmapped, indent=2)}\n\n"
-        f"Available Kimai projects (name → id):\n{json.dumps(project_map, indent=2)}\n\n"
+        f"Available Kimai projects ('Customer / Project' → id):\n{json.dumps(project_map, indent=2)}\n\n"
         "Rules:\n"
         "- Only return a project ID when the sample titles reference something "
         "specific — a named project, client, document, or task — that clearly "
@@ -154,7 +199,7 @@ def classify_keys_with_claude(api_key: str, unmapped: dict, projects: list, mapp
         "title still has to name something specific (e.g. \"Q3 Marketing Plan - "
         "Google Docs\" is specific; \"Google Calendar\" or \"Sign in - Google "
         "accounts\" is not).\n"
-        "- Prefer null over a weak guess, even if some project seems plausible.\n"
+        "- Prefer null over a weak guess, even if some project seems plausible.\n- A project named \"General\", \"Misc\" or similar is NOT a catch-all. It belongs to the customer named before the slash, so only use it for that customer's work. Cross-cutting tools that serve every project (a chat client, a task manager, a terminal, a news site) belong to no project: return null.\n"
         "- Every activity key in the input must appear as a key in your response.\n\n"
         "Respond with exactly this JSON structure:\n"
         '{"key1": "id_or_null", "key2": "id_or_null", ...}'

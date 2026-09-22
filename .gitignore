@@ -1,9 +1,11 @@
 # User credentials — never commit these
 config.json
 project_mappings.json*
+android_categories.json
 google_tokens.json
 
 # Runtime state
+*-snapshot-*.json
 sent_dates.json
 synced_meetings.json
 tracker.log

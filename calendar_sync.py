@@ -289,6 +289,12 @@ def sync_day(config: dict, date_str: str) -> list:
     if not meetings:
         return []
 
+    # Kimai silently drops a tag it doesn't know: the POST succeeds with no tag
+    # attached and no error, which is why these meeting tags never landed until
+    # now. Create them first.
+    for tag in ("meeting", "calendar"):
+        common.ensure_kimai_tag(config, tag)
+
     synced = _load_synced()
     done = set(synced.get(date_str, []))
     intervals = []

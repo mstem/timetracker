@@ -100,6 +100,12 @@ python3 tracker.py --send-today
 # Send a specific past date
 python3 tracker.py --send 2025-03-15
 
+# Pull the phone's day from RescueTime without sending (see Android tracking)
+python3 tracker.py --sync-android 2025-03-15
+
+# Send only the phone batch for a day whose Mac time already went
+python3 tracker.py --send-android 2025-03-15
+
 # List all Kimai projects (shows IDs)
 python3 tracker.py --list-projects
 
@@ -110,6 +116,7 @@ python3 tracker.py --list-activities
 python3 tracker.py --map my-project-dir PROJECT_ID ACTIVITY_ID
 python3 tracker.py --map chrome:github.com PROJECT_ID ACTIVITY_ID
 python3 tracker.py --map app:Slack PROJECT_ID ACTIVITY_ID
+python3 tracker.py --map android:instagram PROJECT_ID ACTIVITY_ID
 ```
 
 ## Project mappings
@@ -248,6 +255,96 @@ A calendar event is logged when **all** of these hold: it's a timed event (not a
 
 The activity tracker keeps capturing Zoom/Meet time as usual (it's in `video_apps`/`video_domains`). At send time, any tracker time that overlaps a synced meeting block is **trimmed out** — the calendar sync owns the scheduled-meeting time, while tracker time that falls *outside* every meeting (e.g. an unscheduled call, or work before/after the meeting) is kept intact.
 
+## Android tracking (optional)
+
+The tracker only sees the Mac. Phone time comes from [RescueTime](https://www.rescuetime.com),
+pulled once a day and written into `logs/android/` in the same entry shape the Mac
+tracker writes, so the normal send path picks it up.
+
+**Android gives app names and nothing else.** RescueTime, Digital Wellbeing and
+ActivityWatch all read the same `UsageStatsManager` data: an app name and a duration.
+There are no window titles and no browser URLs on Android, so a phone entry is
+`Instagram / 97m` with no way to tell which project the time inside an app belonged
+to. Attribution is per-app and coarse by construction.
+
+The free RescueTime "Lite" plan serves the API this uses. Its two-week history cap and
+30-minute upload cycle are both fine for a daily sync.
+
+### Setup
+
+1. Sign in at `https://www.rescuetime.com/login` (the free Lite plan is enough).
+2. Install **RescueTime** from Google Play (`com.rescuetime.rtx`), sign in with the
+   same account, and grant **App Usage Data** (Usage Access). That single permission
+   is all the tracking needs — "Display over other apps" and "App Monitoring" exist
+   only for the paid blocking feature.
+3. Create a **Data API** key at
+   `https://www.rescuetime.com/rtx/settings/api/key_management`. Leave
+   **Allow queries from** blank: it is an IP allowlist, and a laptop's public IP
+   changes, which would break the sync silently.
+4. In `config.json` set `rescuetime_api_key`, `android_sync_enabled: true`, and
+   `rescuetime_timezone` to **the timezone configured in your RescueTime account**.
+   That is a different setting from `kimai_timezone` and there is deliberately no
+   fallback between them: guessing wrong shifts every phone entry by hours.
+5. Create the Kimai projects the category table needs:
+
+   ```bash
+   python3 android_sync.py --setup --dry-run   # show what it would create
+   python3 android_sync.py --setup             # create them, write android_categories.json
+   ```
+
+### Where phone time lands
+
+Three steps, first match wins:
+
+1. an explicit per-app mapping in `project_mappings.json`, e.g.
+   `android:todoist` — set one with `python3 ai_matcher.py --link "android:todoist" "Coding"`
+2. the RescueTime **category** of the app, via `android_categories.json`
+3. `default_project_id` / `default_activity_id`
+
+Phone keys use their own `android:` namespace, so `android:gmail` and `app:Gmail` are
+separate activities and can bill to different projects. `android_categories.json` is
+written once by `--setup` and is hand-editable afterwards, so re-pointing a whole
+category needs no code change.
+
+Phone apps are deliberately **not** sent to the classifier: an app name with no title
+and no URL gives it nothing to work with, and the category table already routes
+everything. Use `--link` when an app belongs to one project.
+
+Every phone entry is tagged `android` in Kimai, so phone time can be filtered out of
+any report. `blocked_apps` covers Android app names too.
+
+### No double counting
+
+Phone spans that overlap Mac spans (or synced meetings) are **trimmed out** at send
+time, the same rule the calendar sync uses. Without it, a glance at the phone
+mid-coding bills twice and a day's total stops meaning wall-clock time. Phone time
+while the laptop was idle survives whole.
+
+### Commands
+
+```bash
+python3 android_sync.py --day 2026-08-23 --dry-run   # inspect a day, write nothing
+python3 android_sync.py --days 7 --dry-run           # inspect the last week
+python3 tracker.py --sync-android 2026-08-23         # pull and store a day, don't send
+python3 tracker.py --send-android 2026-08-23         # send ONLY the phone batch
+```
+
+`--send-android` exists for a day whose Mac time is already in Kimai: a plain
+`--send` would duplicate it. It clips against synced meetings as well as Mac spans,
+so it obeys the same no-double-counting rule as a full send.
+
+Because RescueTime's free tier uploads on a 30-minute cycle, a day is not sent at
+midnight while `android_sync_enabled` is on — it waits `android_sync_delay_minutes`
+(default 45) and goes out on the next hourly catch-up sweep instead. Otherwise the
+last stretch of phone use would be missed, and `sent_dates.json` has no per-source
+dimension that would let it be added afterwards.
+
+Past that delay the day waits again if the phone data still has not arrived, because
+a day sent Mac-only can never have its phone time added later. The catch-up sweep
+retries the fetch each hour for up to two days, then sends the day without the phone
+side and logs an error saying so. A day the phone genuinely wasn't used stores an
+empty log, so it is never mistaken for a fetch that failed.
+
 ## Privacy / blocklist
 
 Since activity is now tracked for *any* app, not just Terminal, add sensitive apps or domains to `config.json` so they're never logged, classified, or sent anywhere — blocked activity is treated exactly like "no active window":
@@ -276,13 +373,36 @@ All keys below are optional and have built-in defaults — omit any you don't ne
   "video_apps": ["zoom.us", "FaceTime", "QuickTime Player", "VLC"],
   "video_domains": ["youtube.com", "netflix.com", "vimeo.com", "twitch.tv", "meet.google.com", "zoom.us"],
   "idle_threshold_seconds": 600,
-  "min_duration_seconds": {"terminal": 1, "chrome": 60, "app": 60},
+  "min_duration_seconds": {"terminal": 1, "chrome": 60, "app": 60, "android": 120},
+  "android_sync_enabled": false,
+  "rescuetime_api_key": null,
+  "rescuetime_timezone": null,
+  "android_sync_delay_minutes": 45,
   "generic_domains": ["accounts.google.com", "myaccount.google.com", "login.microsoftonline.com", "okta.com"]
 }
 ```
 
-- **`min_duration_seconds`**: how long an activity must stay focused before it's logged at all, per source. Terminal logs almost instantly; Chrome and other apps default to 60s to avoid noise from quick tab/window flicks.
+- **`min_duration_seconds`**: how long an activity must stay focused before it's logged at all, per source. Terminal logs almost instantly; Chrome and other apps default to 60s to avoid noise from quick tab/window flicks. The `android` entry works differently: RescueTime reports in fixed five-minute buckets, so the minimum applies to an app's **daily total** rather than to one span, and a phone app under 120s for the whole day is skipped.
+- **`android_sync_enabled` / `rescuetime_api_key` / `rescuetime_timezone` / `android_sync_delay_minutes`**: phone tracking, see [Android tracking](#android-tracking-optional). `rescuetime_timezone` is required when the sync is on and is **not** interchangeable with `kimai_timezone`.
 - **`generic_domains`**: Chrome domains that are pure auth infrastructure — a sign-in screen never carries project signal, so these are never even sent to Claude. These are exact matches (unlike `blocked_domains`/`video_domains`, which also match subdomains), so `accounts.google.com` won't swallow `docs.google.com` or `calendar.google.com` — those still get classified normally when the tab title names something specific. Search engines (`google.com`, etc.) are deliberately **not** in this list by default — their titles can carry real signal — but note the tradeoff: the mapping key is per-domain, so a single confident match caches and applies to every future search on that domain too, including unrelated ones. Add search domains back to `generic_domains` yourself if that risk isn't worth it for you.
+
+## Stop time to exist.io (optional)
+
+`exist_sync.py` sends the time you stopped work to an [exist.io](https://exist.io) time-of-day attribute, so the day's finish sits alongside your mood, sleep and activity data. The tracker already knows it: a span ends at the last keyboard or mouse input before the machine went idle.
+
+It sends the end of the last span before the **evening break**, not the last span of the day, so an hour back at the laptop after dinner doesn't move the finish time. The day is cut at the first gap of `exist_dinner_gap_minutes` (default 60) starting after `exist_earliest_stop_hour` (default 15), and `exist_padding_minutes` (default 5) is added to the result. Video playback is dropped before the gap search, so a film doesn't read as work.
+
+Writing to exist.io needs an OAuth2 client: simple tokens minted from a username and password are read-only, and every write endpoint refuses them. Register a client under **Developer apps** on your [exist.io account page](https://exist.io/account/), run its authorisation flow with the `productivity_read productivity_write` scopes, and put the resulting access token in the environment as `EXIST_WRITE_TOKEN`.
+
+```bash
+export EXIST_WRITE_TOKEN=...
+python3 exist_sync.py --setup      # create and acquire the attribute, once
+python3 exist_sync.py --dry-run    # print today's stop time, send nothing
+python3 exist_sync.py              # send today
+python3 exist_sync.py --date 2026-09-20
+```
+
+`--setup` prints the attribute name exist.io assigned, which goes in `config.json` as `exist_attribute_name`. To run it daily, point a launchd agent at `run_exist_sync.sh`, which loads the token and calls the script.
 
 ## Watchdogs (optional)
 
@@ -343,6 +463,7 @@ timetracker/
 ├── tracker.py                 # main daemon: capture, idle detection, aggregation, sending
 ├── ai_matcher.py               # Claude-based project classifier (CLI + importable classify_and_save)
 ├── calendar_sync.py            # Google Calendar → Kimai external-meeting sync (OAuth + filtering)
+├── android_sync.py             # RescueTime → phone app usage (CLI + importable sync_day)
 ├── migrate_clockify_to_kimai.py # one-off: mirror a Clockify workspace into Kimai
 ├── common.py                   # shared config/Kimai/Anthropic/mapping helpers
 ├── check_clockify_mapping.py  # optional Claude Code hook
@@ -352,7 +473,9 @@ timetracker/
 ├── setup.sh                   # signs the app bundle + installs the launchd agents
 ├── TimeTracker.app/           # signed bundle the tracker runs from (holds the Accessibility grant)
 ├── config.example.json        # template — copy to config.json and fill in
+├── android_categories.json    # RescueTime category → Kimai project (written by --setup, hand-editable)
 └── logs/                      # daily JSON logs (auto-created, gitignored)
+    └── android/               # phone logs, kept separate: the daemon rewrites logs/<date>.json every 2s
 ```
 
 ## Logs

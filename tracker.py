@@ -12,6 +12,8 @@ Usage:
   python3 tracker.py                               # run as daemon
   python3 tracker.py --send-today                  # manually send today's log
   python3 tracker.py --send DATE                   # manually send a specific date (YYYY-MM-DD)
+  python3 tracker.py --sync-android [DATE]         # pull the phone's day from RescueTime, don't send
+  python3 tracker.py --send-android DATE           # send only the phone batch (when the Mac side already went)
   python3 tracker.py --list-projects               # list all Kimai projects
   python3 tracker.py --list-activities             # list all Kimai activities
   python3 tracker.py --map KEY PROJECT_ID ACTIVITY_ID  # map an activity key to a Kimai project+activity
@@ -80,6 +82,29 @@ end tell
 '''
 
 CHROME_TITLE_SUFFIX = " - Google Chrome"
+
+# iTerm2 exposes the session's working directory, which Terminal.app does not.
+# Without this every iTerm2 session collapsed into a single `app:iterm2` key,
+# because Claude Code replaces the window title with its own status line and
+# there is no directory left in the text to parse.
+ITERM_PATH_SCRIPT = '''
+tell application "iTerm2"
+    if (count of windows) > 0 then
+        tell current session of current window
+            return variable named "path"
+        end tell
+    else
+        return ""
+    end if
+end tell
+'''
+
+# Terminal.app keys off the window title; iTerm2 keys off the reported cwd.
+TERMINAL_APPS = {"Terminal", "iTerm2"}
+
+# How long a finished day waits for phone data before it is sent without it.
+# Losing the phone side of one day beats never sending that day at all.
+ANDROID_MAX_HOLD_DAYS = 2
 
 
 @dataclass
@@ -157,6 +182,22 @@ def get_chrome_url():
         return None
 
 
+def get_iterm_path():
+    """Return the frontmost iTerm2 session's working directory, or None."""
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", ITERM_PATH_SCRIPT],
+            capture_output=True, text=True, timeout=3
+        )
+        if result.returncode != 0:
+            log.debug(f"osascript iterm path exit {result.returncode}: {result.stderr.strip()}")
+            return None
+        return result.stdout.strip() or None
+    except Exception as e:
+        log.debug(f"osascript iterm path error: {e}")
+        return None
+
+
 def classify_frontmost(config: dict):
     """Return the current ActivityState, or None if nothing trackable is frontmost."""
     fm = get_frontmost()
@@ -167,8 +208,16 @@ def classify_frontmost(config: dict):
     if app_name == "Firefox":
         return None  # out of scope for now
 
-    if app_name == "Terminal":
+    path = None
+    if app_name in TERMINAL_APPS:
         source, url = "terminal", None
+        if app_name == "iTerm2":
+            path = get_iterm_path()
+            if not path:
+                # No cwd means no reliable key. Falling back to the window title
+                # would file Claude Code status text as a directory name, so treat
+                # it as a plain app instead and let it show up as app:iterm2.
+                source = "app"
     elif app_name == "Google Chrome":
         source = "chrome"
         url = get_chrome_url()
@@ -180,7 +229,7 @@ def classify_frontmost(config: dict):
     if common.is_blocked(source, app_name, url, config):
         return None
 
-    key = common.activity_key(source, window_title, url=url, app=app_name)
+    key = common.activity_key(source, window_title, url=url, app=app_name, path=path)
     return ActivityState(source=source, app=app_name, window=window_title, url=url, key=key)
 
 
@@ -190,6 +239,20 @@ def classify_frontmost(config: dict):
 
 def log_path_for(date: datetime.date) -> str:
     return os.path.join(LOGS_DIR, f"{date.isoformat()}.json")
+
+
+def android_dates() -> set:
+    """Dates with a stored phone log. Note this only finds days already synced:
+    a day the Mac was off entirely leaves no local log to discover, so use
+    `--send DATE` by hand for those."""
+    d = common.ANDROID_LOGS_DIR
+    if not os.path.isdir(d):
+        return set()
+    return {f[:-5] for f in os.listdir(d) if f.endswith(".json")}
+
+
+def has_android_data(date_str: str) -> bool:
+    return os.path.exists(os.path.join(common.ANDROID_LOGS_DIR, f"{date_str}.json"))
 
 
 def load_entries(path: str) -> list:
@@ -289,21 +352,20 @@ def _parse_z(ts: str) -> datetime.datetime:
     return datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
 
 
-def subtract_meetings(entries: list, meetings: list) -> list:
-    """Remove the time spans covered by synced calendar meetings from the raw
-    tracker entries, so meeting time isn't counted twice (the calendar sync
-    already logged it). Each entry is clipped to the sub-spans that fall
-    *outside* every meeting interval; ad-hoc call time with no calendar event
-    survives untouched. `meetings` is a list of (start_utc, end_utc) datetimes.
+def subtract_intervals(entries: list, intervals: list) -> list:
+    """Clip each entry to the sub-spans falling *outside* every given interval,
+    dropping whatever is fully covered. `intervals` is a list of
+    (start_utc, end_utc) naive datetimes.
 
-    Implements the "suppress overlaps only" dedup decision.
+    Implements the "suppress overlaps only" dedup decision, used for both
+    calendar meetings and phone time that overlaps Mac time.
     """
-    if not meetings:
+    if not intervals:
         return entries
     result = []
     for e in entries:
         spans = [(_parse_z(e["start"]), _parse_z(e["end"]))]
-        for m_start, m_end in meetings:
+        for m_start, m_end in intervals:
             next_spans = []
             for s, x in spans:
                 if m_end <= s or m_start >= x:      # no overlap
@@ -324,6 +386,17 @@ def subtract_meetings(entries: list, meetings: list) -> list:
             clipped["seconds"] = secs
             result.append(clipped)
     return result
+
+
+def subtract_meetings(entries: list, meetings: list) -> list:
+    """Remove time already logged by the calendar sync, so meeting time isn't
+    counted twice. Ad-hoc call time with no calendar event survives untouched."""
+    return subtract_intervals(entries, meetings)
+
+
+def entry_intervals(entries: list) -> list:
+    """The (start, end) UTC intervals covered by a set of log entries."""
+    return [(_parse_z(e["start"]), _parse_z(e["end"])) for e in entries]
 
 
 def _sync_meetings(config: dict, date_str: str) -> list:
@@ -356,9 +429,87 @@ def send_to_kimai(config: dict, date_str: str, entries: list) -> tuple:
     entries = subtract_meetings(entries, meetings)
 
     mappings = ai_matcher.classify_and_save(config, entries)
-    groups = aggregate_entries(entries)
     default_project = config.get("default_project_id")
     default_activity = config.get("default_activity_id")
+
+    def resolve_mac(key: str):
+        mapping = mappings.get(key) or {}
+        return (mapping.get("project") or default_project,
+                mapping.get("activity") or default_activity)
+
+    sent, failed = _post_groups(config, date_str, aggregate_entries(entries), resolve_mac)
+    a_sent, a_failed = _send_android(config, date_str, entries, meetings, mappings)
+    return sent + a_sent, failed + a_failed
+
+
+def _send_android(config: dict, date_str: str, mac_entries: list, meetings: list,
+                  mappings: dict) -> tuple:
+    """Pull the phone's app usage for the day and send it to Kimai as its own
+    tagged batch.
+
+    Phone spans are clipped against Mac spans and meeting spans first: without
+    that, a glance at the phone mid-coding bills twice and a day's total stops
+    meaning wall-clock time. Phone time while the laptop was idle survives whole.
+
+    Routing order per app: an explicit per-app mapping wins, then the RescueTime
+    category table, then the configured defaults. No LLM call happens here — the
+    category table already routes every app, and an app name with no title or URL
+    gives a classifier nothing to work with.
+    """
+    if not config.get("android_sync_enabled"):
+        return 0, 0
+    try:
+        import android_sync
+    except Exception as e:
+        log.error(f"android_sync import failed: {e}")
+        return 0, 0
+
+    phone = android_sync.sync_day(config, date_str)
+    if not phone:
+        return 0, 0
+
+    before = sum(e["seconds"] for e in phone)
+    phone = subtract_intervals(phone, entry_intervals(mac_entries) + list(meetings))
+    after = sum(e["seconds"] for e in phone)
+    if before != after:
+        log.info(f"Android: clipped {(before - after) // 60}m of {before // 60}m "
+                 f"that overlapped Mac or meeting time")
+    if not phone:
+        log.info("Android: everything overlapped Mac time, nothing to send")
+        return 0, 0
+
+    # An app has one RescueTime category, but pick the longest-running one per
+    # key rather than the first in case a name maps to two.
+    cat_seconds = defaultdict(lambda: defaultdict(int))
+    for e in phone:
+        cat_seconds[common.entry_key(e)][e.get("category") or ""] += e["seconds"]
+    cat_by_key = {k: max(v.items(), key=lambda kv: kv[1])[0] for k, v in cat_seconds.items()}
+
+    categories = android_sync.load_categories()
+    default_project = config.get("default_project_id")
+    default_activity = config.get("default_activity_id")
+
+    def resolve_android(key: str):
+        mapping = mappings.get(key) or {}
+        if mapping.get("project"):
+            return mapping["project"], mapping.get("activity") or default_activity
+        target = categories.get(cat_by_key.get(key, "")) or {}
+        if target.get("project"):
+            return target["project"], target.get("activity") or default_activity
+        return default_project, default_activity
+
+    common.ensure_kimai_tag(config, "android")
+    return _post_groups(config, date_str, aggregate_entries(phone), resolve_android,
+                        tags="android")
+
+
+def _post_groups(config: dict, date_str: str, groups: dict, resolve, tags: str = None) -> tuple:
+    """POST one aggregated group per Kimai timesheet. `resolve(key)` returns the
+    (project_id, activity_id) that group belongs to.
+
+    Returns (sent, failed). Per-entry errors are caught so one bad group can't
+    abort the rest.
+    """
     sent = 0
     failed = 0
     for key, data in groups.items():
@@ -370,9 +521,7 @@ def send_to_kimai(config: dict, date_str: str, entries: list) -> tuple:
         end_dt = start_dt + datetime.timedelta(seconds=data["seconds"])
         description = describe_group(key, data)
 
-        mapping = mappings.get(key) or {}
-        project_id = mapping.get("project") or default_project
-        activity_id = mapping.get("activity") or default_activity
+        project_id, activity_id = resolve(key)
         if not project_id or not activity_id:
             # Kimai requires both — without a mapping and without configured
             # defaults there's nowhere to file this; leave it for a later run.
@@ -389,6 +538,8 @@ def send_to_kimai(config: dict, date_str: str, entries: list) -> tuple:
             "billable": False,
             "exported": False,
         }
+        if tags:
+            body["tags"] = tags
 
         try:
             common.kimai_request(config, "POST", "/timesheets", body)
@@ -435,10 +586,10 @@ def cmd_send(date_str: str):
     config = common.load_config()
     path = os.path.join(LOGS_DIR, f"{date_str}.json")
     entries = load_entries(path)
-    if not entries:
+    if not entries and not (config.get("android_sync_enabled") or has_android_data(date_str)):
         print(f"No log found for {date_str}")
         return
-    print(f"Sending {len(entries)} raw entries for {date_str}...")
+    print(f"Sending {len(entries)} raw Mac entries for {date_str}...")
     sent, failed = send_to_kimai(config, date_str, entries)
     if failed:
         print(f"Done — {sent} entries sent, {failed} failed. "
@@ -446,6 +597,45 @@ def cmd_send(date_str: str):
     else:
         mark_date_sent(date_str)
         print(f"Done — {sent} entries sent.")
+
+
+def cmd_sync_android(date_str: str):
+    """Pull the phone's day from RescueTime and store it, without sending."""
+    import android_sync
+    config = common.load_config()
+    if not config.get("android_sync_enabled"):
+        # sync_day returns stored data without fetching when the flag is off, so
+        # without this the command reports an idle phone for a day it never
+        # asked about.
+        print('android_sync_enabled is false in config.json — nothing was fetched. '
+              'Set it to true (and set rescuetime_api_key and rescuetime_timezone) first.')
+        return
+    entries = android_sync.sync_day(config, date_str)
+    if not entries:
+        print(f"No Android activity for {date_str}.")
+        return
+    groups = aggregate_entries(entries)
+    print(f"{date_str}: {len(entries)} phone entries, "
+          f"{sum(e['seconds'] for e in entries) / 3600:.2f}h across {len(groups)} apps")
+    for key, data in sorted(groups.items(), key=lambda kv: -kv[1]["seconds"]):
+        print(f"  {data['seconds'] / 60:6.1f}m  {key}")
+
+
+def cmd_send_android(date_str: str):
+    """Send only the phone batch for a day. Use this when the Mac side of that
+    day is already in Kimai — a plain --send would duplicate it."""
+    config = common.load_config()
+    mac = load_entries(os.path.join(LOGS_DIR, f"{date_str}.json"))
+    mappings = common.load_project_mappings()
+    # Meetings have to be clipped here as well as in the --send path, or phone
+    # time overlapping a synced meeting bills twice. _sync_meetings is safe to
+    # call again: calendar_sync skips any uid already in synced_meetings.json
+    # and still returns the full interval list for the day.
+    meetings = _sync_meetings(config, date_str)
+    print(f"Sending phone time for {date_str} (clipping against {len(mac)} Mac "
+          f"entries and {len(meetings)} meetings already in Kimai)...")
+    sent, failed = _send_android(config, date_str, mac, meetings, mappings)
+    print(f"Done — {sent} phone entries sent, {failed} failed.")
 
 
 # ---------------------------------------------------------------------------
@@ -471,6 +661,53 @@ class Tracker:
 
         signal.signal(signal.SIGTERM, self._on_shutdown)
         signal.signal(signal.SIGINT, self._on_shutdown)
+
+    def _android_hold(self, date_str: str) -> bool:
+        """True while a finished day should still wait before being sent.
+        Local time throughout, matching how log files are named.
+
+        Two separate reasons to wait. The upload lag: RescueTime's free tier
+        uploads on a 30-minute cycle, so sending at 00:00 misses the last
+        stretch of phone use. And the phone data not having arrived at all: the
+        Mac batch and the phone batch go to Kimai in a single pass, and
+        `sent_dates` has no per-source dimension, so a day sent without its
+        phone time can never have that time added afterwards. Holding is the
+        only thing that stops it being lost silently.
+
+        The wait is bounded by ANDROID_MAX_HOLD_DAYS, after which the day goes
+        Mac-only with an error in the log.
+        """
+        if not self.config.get("android_sync_enabled"):
+            return False
+        try:
+            delay = int(self.config.get("android_sync_delay_minutes", 45))
+            day = datetime.date.fromisoformat(date_str)
+        except (TypeError, ValueError):
+            return False
+        ready_at = (datetime.datetime.combine(day, datetime.time.min)
+                    + datetime.timedelta(days=1, minutes=delay))
+        if datetime.datetime.now() < ready_at:
+            return True
+        if has_android_data(date_str):
+            return False
+        # Past the lag with nothing stored means the fetch never landed. Pull it
+        # here rather than at send time: sync_day writes the day on success,
+        # including a day with no phone use at all, which stores an empty list
+        # and so reads as "asked and answered" rather than "never asked".
+        try:
+            import android_sync
+            android_sync.sync_day(self.config, date_str)
+        except Exception as e:
+            log.error(f"Android pre-fetch failed for {date_str}: {e}")
+        if has_android_data(date_str):
+            return False
+        if datetime.datetime.now() < ready_at + datetime.timedelta(days=ANDROID_MAX_HOLD_DAYS):
+            log.warning(f"{date_str}: no phone data yet, holding the day")
+            return True
+        log.error(f"{date_str}: still no phone data after {ANDROID_MAX_HOLD_DAYS} "
+                  f"days — sending Mac time only. Phone time for this day is lost; "
+                  f"recover it with --send-android once RescueTime has it.")
+        return False
 
     def _min_duration_for(self, source: str) -> int:
         configured = self.config.get("min_duration_seconds", {})
@@ -560,6 +797,14 @@ class Tracker:
             return
         # Day rolled over — send yesterday's log
         yesterday = self.current_date.isoformat()
+        if yesterday not in self.sent_dates and self._android_hold(yesterday):
+            # RescueTime's free tier uploads on a 30-minute cycle, so sending at
+            # 00:00 would miss the last stretch of phone use, and sent_dates has
+            # no per-source dimension to let it be added later. Let the hourly
+            # _send_missed_days sweep pick the day up once the data has landed.
+            log.info(f"Midnight rollover — holding {yesterday} for the phone upload lag")
+            self.current_date = today
+            return
         if yesterday not in self.sent_dates:
             log.info(f"Midnight rollover — sending {yesterday}")
             path = log_path_for(self.current_date)
@@ -583,6 +828,7 @@ class Tracker:
 
     def run(self):
         log.info("Tracker started.")
+        common.check_kimai_timezone(self.config)
         # On startup, send any unsent past days
         self._send_missed_days()
         last_retry = datetime.datetime.utcnow()
@@ -663,18 +909,22 @@ class Tracker:
     def _send_missed_days(self):
         """Send any log files that were never sent (e.g. if daemon was off at midnight)."""
         today = datetime.date.today().isoformat()
-        for fname in sorted(os.listdir(LOGS_DIR)):
-            if not fname.endswith(".json"):
-                continue
-            date_str = fname[:-5]
+        dates = {f[:-5] for f in os.listdir(LOGS_DIR) if f.endswith(".json")}
+        if self.config.get("android_sync_enabled"):
+            # Only when the sync is on: a stored phone log left over from when it
+            # was enabled would otherwise surface a day the send guard below
+            # refuses to handle, and the sweep would re-announce it every hour.
+            dates |= android_dates()
+        for date_str in sorted(dates):
             if date_str >= today:
                 continue  # don't send today's partial log
             if date_str in self.sent_dates:
                 continue
+            if self._android_hold(date_str):
+                continue
             log.info(f"Found unsent log for {date_str}, sending...")
-            path = os.path.join(LOGS_DIR, fname)
-            entries = load_entries(path)
-            if entries:
+            entries = load_entries(os.path.join(LOGS_DIR, f"{date_str}.json"))
+            if entries or self.config.get("android_sync_enabled"):
                 try:
                     sent, failed = send_to_kimai(self.config, date_str, entries)
                     self._settle_send(date_str, sent, failed)
@@ -713,6 +963,10 @@ if __name__ == "__main__":
             cmd_send(datetime.date.today().isoformat())
         elif sys.argv[1] == "--send" and len(sys.argv) == 3:
             cmd_send(sys.argv[2])
+        elif sys.argv[1] == "--sync-android":
+            cmd_sync_android(sys.argv[2] if len(sys.argv) == 3 else datetime.date.today().isoformat())
+        elif sys.argv[1] == "--send-android" and len(sys.argv) == 3:
+            cmd_send_android(sys.argv[2])
         elif sys.argv[1] == "--list-projects":
             cmd_list_projects()
         elif sys.argv[1] == "--list-activities":
