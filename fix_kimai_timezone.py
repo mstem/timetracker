@@ -155,28 +155,45 @@ def main(apply: bool):
 
     stamp = _naive(plan[0][0]["begin"]).strftime("%Y%m%d") + "-" + str(len(plan))
     snap_path = os.path.join(common.BASE_DIR, f"fix-timezone-snapshot-{stamp}.json")
-    with open(snap_path, "w") as f:
-        json.dump([{"id": e["id"], "begin": e["begin"], "end": e["end"],
-                    "duration": e["duration"], "description": e.get("description")}
-                   for e, _, _, _, _ in plan], f, indent=2)
-    print(f"\nSnapshot written: {snap_path}")
+
+    # The snapshot is the rollback record AND the skip list for later runs, so an
+    # entry may only appear in it once its PATCH has actually succeeded. Writing
+    # the whole plan up front recorded entries that failed, and already_fixed_ids
+    # then skipped them forever, leaving them shifted with no route back.
+    done_rows = []
+
+    def write_snapshot():
+        with open(snap_path, "w") as f:
+            json.dump(done_rows, f, indent=2)
 
     ok = failed = drift = 0
-    for e, nb, ne, _, _ in plan:
-        try:
-            res = common.kimai_request(config, "PATCH", f"/timesheets/{e['id']}",
-                                       {"begin": nb, "end": ne})
+    try:
+        for e, nb, ne, _, _ in plan:
+            try:
+                res = common.kimai_request(config, "PATCH", f"/timesheets/{e['id']}",
+                                           {"begin": nb, "end": ne})
+            except Exception as exc:
+                print(f"  FAILED {e['id']}: {exc}")
+                failed += 1
+                continue
+            done_rows.append({"id": e["id"], "begin": e["begin"], "end": e["end"],
+                              "duration": e["duration"],
+                              "description": e.get("description")})
             if res.get("duration") != e["duration"]:
                 # Kimai rounds timestamps, so flag any entry whose length moved.
                 print(f"  duration changed on {e['id']}: "
                       f"{e['duration']}s -> {res.get('duration')}s")
                 drift += 1
             ok += 1
-        except Exception as exc:
-            print(f"  FAILED {e['id']}: {exc}")
-            failed += 1
+    finally:
+        # Even on Ctrl-C or a crash, what was changed has to be recoverable.
+        write_snapshot()
+        print(f"\nSnapshot written: {snap_path} ({len(done_rows)} entries changed)")
 
     print(f"\n{ok} updated, {failed} failed, {drift} with a duration change.")
+    if failed:
+        print(f"The {failed} failures were not recorded in the snapshot, so "
+              f"re-running picks them up.")
     print(f"To undo: re-apply the begin/end values in {os.path.basename(snap_path)}.")
 
 

@@ -75,6 +75,22 @@ def parse_ts(ts):
     )
 
 
+def naive_utc(dt):
+    """Normalise a parsed Kimai timestamp to the naive-UTC value
+    common.kimai_local_time expects.
+
+    Kimai returns an offset (e.g. "+0100"), and that offset has to be
+    *converted*, not dropped: kimai_local_time opens with
+    .replace(tzinfo=utc), so handing it an aware datetime reinterprets the
+    local wall clock as UTC and writes the entry hours from where it belongs.
+    Durations survive, because both ends move together, so nothing downstream
+    notices.
+    """
+    if dt.tzinfo is None:
+        return dt
+    return dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+
+
 def load_claude_events():
     """[(timestamp, cwd)] across every Claude Code account, sorted by time."""
     events = []
@@ -271,9 +287,9 @@ def fix_rounding(config, args):
         try:
             common.kimai_request(config, "PATCH", f"/timesheets/{t['id']}",
                                  {"begin": common.kimai_local_time(
-                                      parse_ts(t["begin"]).replace(tzinfo=None), config),
+                                      naive_utc(parse_ts(t["begin"])), config),
                                   "end": common.kimai_local_time(
-                                      new_end.replace(tzinfo=None), config)})
+                                      naive_utc(new_end), config)})
             patched += 1
         except Exception as e:
             failed += 1
@@ -421,7 +437,7 @@ def main():
 
     for p in plan:
         t = p["entry"]
-        cursor = parse_ts(t["begin"])
+        cursor = naive_utc(parse_ts(t["begin"]))
         made = 0
         for key, secs in p["splits"]:
             proj, act = target(key)
