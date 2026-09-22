@@ -102,6 +102,10 @@ end tell
 # Terminal.app keys off the window title; iTerm2 keys off the reported cwd.
 TERMINAL_APPS = {"Terminal", "iTerm2"}
 
+# How long a finished day waits for phone data before it is sent without it.
+# Losing the phone side of one day beats never sending that day at all.
+ANDROID_MAX_HOLD_DAYS = 2
+
 
 @dataclass
 class ActivityState:
@@ -599,6 +603,13 @@ def cmd_sync_android(date_str: str):
     """Pull the phone's day from RescueTime and store it, without sending."""
     import android_sync
     config = common.load_config()
+    if not config.get("android_sync_enabled"):
+        # sync_day returns stored data without fetching when the flag is off, so
+        # without this the command reports an idle phone for a day it never
+        # asked about.
+        print('android_sync_enabled is false in config.json — nothing was fetched. '
+              'Set it to true (and set rescuetime_api_key and rescuetime_timezone) first.')
+        return
     entries = android_sync.sync_day(config, date_str)
     if not entries:
         print(f"No Android activity for {date_str}.")
@@ -616,9 +627,14 @@ def cmd_send_android(date_str: str):
     config = common.load_config()
     mac = load_entries(os.path.join(LOGS_DIR, f"{date_str}.json"))
     mappings = common.load_project_mappings()
-    print(f"Sending phone time for {date_str} "
-          f"(clipping against {len(mac)} Mac entries already in Kimai)...")
-    sent, failed = _send_android(config, date_str, mac, [], mappings)
+    # Meetings have to be clipped here as well as in the --send path, or phone
+    # time overlapping a synced meeting bills twice. _sync_meetings is safe to
+    # call again: calendar_sync skips any uid already in synced_meetings.json
+    # and still returns the full interval list for the day.
+    meetings = _sync_meetings(config, date_str)
+    print(f"Sending phone time for {date_str} (clipping against {len(mac)} Mac "
+          f"entries and {len(meetings)} meetings already in Kimai)...")
+    sent, failed = _send_android(config, date_str, mac, meetings, mappings)
     print(f"Done — {sent} phone entries sent, {failed} failed.")
 
 
@@ -647,9 +663,20 @@ class Tracker:
         signal.signal(signal.SIGINT, self._on_shutdown)
 
     def _android_hold(self, date_str: str) -> bool:
-        """True while a finished day should still wait for RescueTime's next
-        upload before being sent. Local time throughout, matching how log files
-        are named."""
+        """True while a finished day should still wait before being sent.
+        Local time throughout, matching how log files are named.
+
+        Two separate reasons to wait. The upload lag: RescueTime's free tier
+        uploads on a 30-minute cycle, so sending at 00:00 misses the last
+        stretch of phone use. And the phone data not having arrived at all: the
+        Mac batch and the phone batch go to Kimai in a single pass, and
+        `sent_dates` has no per-source dimension, so a day sent without its
+        phone time can never have that time added afterwards. Holding is the
+        only thing that stops it being lost silently.
+
+        The wait is bounded by ANDROID_MAX_HOLD_DAYS, after which the day goes
+        Mac-only with an error in the log.
+        """
         if not self.config.get("android_sync_enabled"):
             return False
         try:
@@ -659,7 +686,28 @@ class Tracker:
             return False
         ready_at = (datetime.datetime.combine(day, datetime.time.min)
                     + datetime.timedelta(days=1, minutes=delay))
-        return datetime.datetime.now() < ready_at
+        if datetime.datetime.now() < ready_at:
+            return True
+        if has_android_data(date_str):
+            return False
+        # Past the lag with nothing stored means the fetch never landed. Pull it
+        # here rather than at send time: sync_day writes the day on success,
+        # including a day with no phone use at all, which stores an empty list
+        # and so reads as "asked and answered" rather than "never asked".
+        try:
+            import android_sync
+            android_sync.sync_day(self.config, date_str)
+        except Exception as e:
+            log.error(f"Android pre-fetch failed for {date_str}: {e}")
+        if has_android_data(date_str):
+            return False
+        if datetime.datetime.now() < ready_at + datetime.timedelta(days=ANDROID_MAX_HOLD_DAYS):
+            log.warning(f"{date_str}: no phone data yet, holding the day")
+            return True
+        log.error(f"{date_str}: still no phone data after {ANDROID_MAX_HOLD_DAYS} "
+                  f"days — sending Mac time only. Phone time for this day is lost; "
+                  f"recover it with --send-android once RescueTime has it.")
+        return False
 
     def _min_duration_for(self, source: str) -> int:
         configured = self.config.get("min_duration_seconds", {})
@@ -862,7 +910,11 @@ class Tracker:
         """Send any log files that were never sent (e.g. if daemon was off at midnight)."""
         today = datetime.date.today().isoformat()
         dates = {f[:-5] for f in os.listdir(LOGS_DIR) if f.endswith(".json")}
-        dates |= android_dates()
+        if self.config.get("android_sync_enabled"):
+            # Only when the sync is on: a stored phone log left over from when it
+            # was enabled would otherwise surface a day the send guard below
+            # refuses to handle, and the sweep would re-announce it every hour.
+            dates |= android_dates()
         for date_str in sorted(dates):
             if date_str >= today:
                 continue  # don't send today's partial log

@@ -330,13 +330,20 @@ python3 tracker.py --send-android 2026-08-23         # send ONLY the phone batch
 ```
 
 `--send-android` exists for a day whose Mac time is already in Kimai: a plain
-`--send` would duplicate it.
+`--send` would duplicate it. It clips against synced meetings as well as Mac spans,
+so it obeys the same no-double-counting rule as a full send.
 
 Because RescueTime's free tier uploads on a 30-minute cycle, a day is not sent at
 midnight while `android_sync_enabled` is on — it waits `android_sync_delay_minutes`
 (default 45) and goes out on the next hourly catch-up sweep instead. Otherwise the
 last stretch of phone use would be missed, and `sent_dates.json` has no per-source
 dimension that would let it be added afterwards.
+
+Past that delay the day waits again if the phone data still has not arrived, because
+a day sent Mac-only can never have its phone time added later. The catch-up sweep
+retries the fetch each hour for up to two days, then sends the day without the phone
+side and logs an error saying so. A day the phone genuinely wasn't used stores an
+empty log, so it is never mistaken for a fetch that failed.
 
 ## Privacy / blocklist
 

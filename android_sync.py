@@ -280,8 +280,13 @@ def sync_day(config: dict, date_str: str) -> list:
     try:
         rows = fetch_rows(config, date_str)
         if not rows:
+            # Store the empty answer. A missing file means "never successfully
+            # asked", which is what tracker._android_hold waits on; without this
+            # a day the phone genuinely wasn't used would be held to the
+            # deadline every time.
             log.info(f"Android: no RescueTime mobile rows for {date_str}")
-            return load_day(date_str)
+            write_day(date_str, [])
+            return []
         entries = rows_to_entries(rows, config)
         write_day(date_str, entries)
         total = sum(e["seconds"] for e in entries)
