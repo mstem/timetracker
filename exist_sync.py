@@ -20,6 +20,7 @@ Usage:
 
 import argparse
 import datetime
+import importlib.util
 import json
 import os
 import sys
@@ -126,20 +127,40 @@ def minutes_from_midnight(when: datetime.datetime, config: dict) -> int:
 # exist.io
 # ---------------------------------------------------------------------------
 
-def exist_request(token: str, path: str, body=None):
-    data = json.dumps(body).encode() if body is not None else None
+# daily-briefing owns the writing half of this exist.io client: exist_write.py
+# there holds acquire, update, batching and the API's rules, and its Garmin and
+# Kimai writers already lean on it. Importing it by path keeps one writer for
+# the account rather than a second copy that drifts. The two projects are
+# separate repos on the same machine, hence the path rather than a package.
+PEER_WRITER = os.path.expanduser("~/Projects/daily-briefing/exist_write.py")
+
+
+def peer_writer():
+    if not os.path.exists(PEER_WRITER):
+        print(f"ERROR: {PEER_WRITER} not found — it does the posting for this account.")
+        sys.exit(1)
+    spec = importlib.util.spec_from_file_location("exist_write", PEER_WRITER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def create_attribute(token: str, label: str, group: str):
+    """The one call exist_write does not cover, since its writers only ever
+    acquire attributes that already exist."""
     req = urllib.request.Request(
-        EXIST_API + path,
-        data=data,
+        EXIST_API + "/attributes/create/?success_objects=1",
+        data=json.dumps([{"label": label, "group": group,
+                          "value_type": VALUE_TYPE_TIME_OF_DAY,
+                          "manual": False}]).encode(),
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        method="POST" if data is not None else "GET",
-    )
+        method="POST")
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
             return json.loads(r.read())
     except urllib.error.HTTPError as e:
         detail = e.read().decode(errors="replace")
-        raise RuntimeError(f"exist.io {e.code} on {path}: {detail}") from None
+        raise RuntimeError(f"exist.io {e.code} on create: {detail}") from None
 
 
 def setup_attribute(config: dict) -> str:
@@ -148,34 +169,32 @@ def setup_attribute(config: dict) -> str:
     label = config.get("exist_attribute_label", DEFAULT_LABEL)
     group = config.get("exist_attribute_group", DEFAULT_GROUP)
 
-    created = exist_request(token, "/attributes/create/?success_objects=1", [{
-        "label": label,
-        "group": group,
-        "value_type": VALUE_TYPE_TIME_OF_DAY,
-        "manual": False,
-    }])
-    if created.get("failed"):
-        print("Create failed:", json.dumps(created["failed"], indent=2))
+    created = create_attribute(token, label, group)
+    failed = created.get("failed") or []
+    if failed and failed[0].get("error_code") != "exists":
+        print("Create failed:", json.dumps(failed, indent=2))
         sys.exit(1)
 
     # The name exist.io assigns is not guaranteed to match the label, so read
-    # it back rather than guessing it from the label.
-    name = created["success"][0]["name"]
-    acquired = exist_request(token, "/attributes/acquire/", [{"name": name}])
-    if acquired.get("failed"):
-        print("Acquire failed:", json.dumps(acquired["failed"], indent=2))
+    # it back rather than guessing it from the label. An attribute that already
+    # exists reports its name the same way.
+    name = (created.get("success") or failed)[0]["name"]
+
+    # acquire keeps manual=True, so the attribute stays editable by hand in the
+    # Exist apps even though this writes it.
+    acquired, failures = peer_writer().acquire(token, [name])
+    if failures:
+        print("Acquire failed:", json.dumps(failures, indent=2))
         sys.exit(1)
     return name
 
 
 def send_stop(config: dict, name: str, date_str: str, minutes: int):
-    token = exist_token(config)
-    result = exist_request(token, "/attributes/update/", [{
-        "name": name, "date": date_str, "value": minutes,
-    }])
-    if result.get("failed"):
-        raise RuntimeError(json.dumps(result["failed"]))
-    return result
+    written, failures = peer_writer().update(
+        exist_token(config), [{"name": name, "date": date_str, "value": minutes}])
+    if failures:
+        raise RuntimeError(json.dumps(failures))
+    return written
 
 
 # ---------------------------------------------------------------------------
