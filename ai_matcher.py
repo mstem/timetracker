@@ -129,7 +129,15 @@ def classify_keys_with_claude(api_key: str, unmapped: dict, projects: list, mapp
     # Exclude archived projects. They stay visible in Kimai for historical
     # reporting, but offering them as candidates means old work keeps attracting
     # new entries. "Urban League / General" collected 83 hours this way.
-    excluded = set(config_excluded_project_ids())
+    # Kimai project ids are ints; config.json is hand-edited and may hold them
+    # as strings, in which case an uncoerced `in` test quietly matches nothing
+    # and the guard does the opposite of its job.
+    excluded = set()
+    for i in config_excluded_project_ids():
+        try:
+            excluded.add(int(i))
+        except (TypeError, ValueError):
+            log.warning(f"excluded_project_ids: ignoring non-numeric entry {i!r}")
     if excluded:
         skipped = [p["name"] for p in projects if p["id"] in excluded]
         projects = [p for p in projects if p["id"] not in excluded]
