@@ -281,9 +281,9 @@ def sync_day(config: dict, date_str: str) -> list:
         rows = fetch_rows(config, date_str)
         if not rows:
             # Store the empty answer. A missing file means "never successfully
-            # asked", which is what tracker._android_hold waits on; without this
-            # a day the phone genuinely wasn't used would be held to the
-            # deadline every time.
+            # asked", which is what the tracker's phone source waits on; a day
+            # the phone genuinely wasn't used must settle rather than be
+            # retried until it ages out of RescueTime's history.
             log.info(f"Android: no RescueTime mobile rows for {date_str}")
             write_day(date_str, [])
             return []

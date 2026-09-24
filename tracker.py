@@ -14,6 +14,7 @@ Usage:
   python3 tracker.py --send DATE                   # manually send a specific date (YYYY-MM-DD)
   python3 tracker.py --sync-android [DATE]         # pull the phone's day from RescueTime, don't send
   python3 tracker.py --send-android DATE           # send only the phone batch (when the Mac side already went)
+  python3 tracker.py --self-test                   # check the send-state logic, no network
   python3 tracker.py --list-projects               # list all Kimai projects
   python3 tracker.py --list-activities             # list all Kimai activities
   python3 tracker.py --map KEY PROJECT_ID ACTIVITY_ID  # map an activity key to a Kimai project+activity
@@ -28,6 +29,7 @@ import sys
 import time
 import datetime
 import urllib.error
+import shutil
 import signal
 import logging
 from collections import defaultdict
@@ -102,9 +104,6 @@ end tell
 # Terminal.app keys off the window title; iTerm2 keys off the reported cwd.
 TERMINAL_APPS = {"Terminal", "iTerm2"}
 
-# How long a finished day waits for phone data before it is sent without it.
-# Losing the phone side of one day beats never sending that day at all.
-ANDROID_MAX_HOLD_DAYS = 2
 
 
 @dataclass
@@ -417,14 +416,26 @@ def _sync_meetings(config: dict, date_str: str) -> list:
         return []
 
 
-def send_to_kimai(config: dict, date_str: str, entries: list) -> tuple:
+def send_to_kimai(config: dict, date_str: str, entries: list, sources=None) -> dict:
     """Sync external calendar meetings, then classify newly-seen activity and
-    send aggregated daily tracker entries to Kimai (minus any time already
-    covered by a synced meeting).
+    send the day's aggregated entries to Kimai (minus any time already covered
+    by a synced meeting).
 
-    Returns (sent, failed). Per-entry errors are caught so one bad group can't
-    abort the rest, so callers must check `failed` before marking the day sent —
-    an exception never reaches them."""
+    `sources` selects which halves of the day to send, defaulting to both. They
+    are settled independently by the caller, because the Mac log is complete at
+    midnight while the phone's day may not exist yet.
+
+    Returns {source: (sent, failed, settled)}. `settled` is False only when the
+    source cannot be judged yet, which today means the phone data has not
+    arrived; such a source must be retried rather than recorded as done.
+    Per-entry errors are caught so one bad group cannot abort the rest, so
+    callers must check `failed` before recording a source as sent."""
+    sources = set(sources or ALL_SOURCES)
+    results = {}
+
+    # Meetings are needed by both halves: the Mac side subtracts them, and the
+    # phone side clips against them. calendar_sync skips any uid it has already
+    # posted, so calling this on an android-only send cannot duplicate them.
     meetings = _sync_meetings(config, date_str)
     entries = subtract_meetings(entries, meetings)
 
@@ -432,18 +443,25 @@ def send_to_kimai(config: dict, date_str: str, entries: list) -> tuple:
     default_project = config.get("default_project_id")
     default_activity = config.get("default_activity_id")
 
-    def resolve_mac(key: str):
-        mapping = mappings.get(key) or {}
-        return (mapping.get("project") or default_project,
-                mapping.get("activity") or default_activity)
+    if SOURCE_MAC in sources:
+        def resolve_mac(key: str):
+            mapping = mappings.get(key) or {}
+            return (mapping.get("project") or default_project,
+                    mapping.get("activity") or default_activity)
 
-    sent, failed = _post_groups(config, date_str, aggregate_entries(entries), resolve_mac)
-    a_sent, a_failed = _send_android(config, date_str, entries, meetings, mappings)
-    return sent + a_sent, failed + a_failed
+        sent, failed = _post_groups(config, date_str,
+                                    aggregate_entries(entries), resolve_mac)
+        results[SOURCE_MAC] = (sent, failed, True)
+
+    if SOURCE_ANDROID in sources:
+        results[SOURCE_ANDROID] = _send_android(config, date_str, entries,
+                                                meetings, mappings)
+    return results
 
 
 def _send_android(config: dict, date_str: str, mac_entries: list, meetings: list,
                   mappings: dict) -> tuple:
+    """Returns (sent, failed, settled). See send_to_kimai for `settled`."""
     """Pull the phone's app usage for the day and send it to Kimai as its own
     tagged batch.
 
@@ -457,16 +475,22 @@ def _send_android(config: dict, date_str: str, mac_entries: list, meetings: list
     gives a classifier nothing to work with.
     """
     if not config.get("android_sync_enabled"):
-        return 0, 0
+        # Nothing to wait for, so the source is settled rather than pending.
+        return 0, 0, True
     try:
         import android_sync
     except Exception as e:
         log.error(f"android_sync import failed: {e}")
-        return 0, 0
+        return 0, 0, False
 
     phone = android_sync.sync_day(config, date_str)
     if not phone:
-        return 0, 0
+        # sync_day stores the day whenever the fetch succeeded, including a day
+        # the phone genuinely was not used, which writes an empty list. So a
+        # stored day means "asked and answered" and an absent one means the
+        # upload has not arrived: the difference between nothing to send and
+        # not knowing yet.
+        return 0, 0, has_android_data(date_str)
 
     before = sum(e["seconds"] for e in phone)
     phone = subtract_intervals(phone, entry_intervals(mac_entries) + list(meetings))
@@ -476,7 +500,7 @@ def _send_android(config: dict, date_str: str, mac_entries: list, meetings: list
                  f"that overlapped Mac or meeting time")
     if not phone:
         log.info("Android: everything overlapped Mac time, nothing to send")
-        return 0, 0
+        return 0, 0, True
 
     # An app has one RescueTime category, but pick the longest-running one per
     # key rather than the first in case a name maps to two.
@@ -499,8 +523,9 @@ def _send_android(config: dict, date_str: str, mac_entries: list, meetings: list
         return default_project, default_activity
 
     common.ensure_kimai_tag(config, "android")
-    return _post_groups(config, date_str, aggregate_entries(phone), resolve_android,
-                        tags="android")
+    sent, failed = _post_groups(config, date_str, aggregate_entries(phone),
+                                resolve_android, tags="android")
+    return sent, failed, True
 
 
 def _post_groups(config: dict, date_str: str, groups: dict, resolve, tags: str = None) -> tuple:
@@ -564,18 +589,69 @@ def _post_groups(config: dict, date_str: str, groups: dict, resolve, tags: str =
 # Sent-dates tracking
 # ---------------------------------------------------------------------------
 
-def load_sent_dates() -> set:
-    if os.path.exists(SENT_FILE):
+# A day's work reaches Kimai from two independent sources, and they do not
+# arrive together: the Mac log is complete at midnight, while the phone's day
+# only exists once RescueTime has uploaded it, which can be hours later or never.
+# Recording the day as one atom meant a day sent before the phone data landed
+# could never have it added, so it was lost with nothing saying so.
+SOURCE_MAC = "mac"
+SOURCE_ANDROID = "android"
+ALL_SOURCES = (SOURCE_MAC, SOURCE_ANDROID)
+
+# RescueTime's free plan serves two weeks of history. Past that a day's phone
+# time cannot be fetched at all, so retrying it forever is just noise.
+PHONE_HISTORY_DAYS = 14
+
+
+def load_sent_state() -> dict:
+    """{date: set(sources)} recording which sources have reached Kimai.
+
+    Reads the legacy format too: a bare list of dates, each meaning the whole
+    day went. Those are recorded as both sources sent, so migrating never
+    re-sends a historical day.
+    """
+    if not os.path.exists(SENT_FILE):
+        return {}
+    with open(SENT_FILE) as f:
+        raw = json.load(f)
+    if isinstance(raw, list):
+        return {d: set(ALL_SOURCES) for d in raw}
+    return {d: set(v) for d, v in raw.items()}
+
+
+def sent_state_is_legacy() -> bool:
+    """True while sent_dates.json still holds the bare list of dates."""
+    if not os.path.exists(SENT_FILE):
+        return False
+    try:
         with open(SENT_FILE) as f:
-            return set(json.load(f))
-    return set()
+            return isinstance(json.load(f), list)
+    except (json.JSONDecodeError, OSError):
+        return False
 
 
-def mark_date_sent(date_str: str):
-    sent = load_sent_dates()
-    sent.add(date_str)
-    with open(SENT_FILE, "w") as f:
-        json.dump(sorted(sent), f)
+def backup_sent_state() -> str | None:
+    """Copy sent_dates.json aside before the format changes under it. This file
+    is the only thing preventing a day being sent twice, so it is worth a copy."""
+    if not os.path.exists(SENT_FILE):
+        return None
+    dest = f"{SENT_FILE}.legacy-{datetime.datetime.now():%Y%m%d-%H%M%S}"
+    shutil.copy2(SENT_FILE, dest)
+    return dest
+
+
+def save_sent_state(state: dict):
+    """Write atomically: the daemon may be mid-send when this is replaced."""
+    tmp = SENT_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({d: sorted(v) for d, v in sorted(state.items())}, f, indent=0)
+    os.replace(tmp, SENT_FILE)
+
+
+def mark_source_sent(date_str: str, source: str):
+    state = load_sent_state()
+    state.setdefault(date_str, set()).add(source)
+    save_sent_state(state)
 
 
 # ---------------------------------------------------------------------------
@@ -590,13 +666,19 @@ def cmd_send(date_str: str):
         print(f"No log found for {date_str}")
         return
     print(f"Sending {len(entries)} raw Mac entries for {date_str}...")
-    sent, failed = send_to_kimai(config, date_str, entries)
-    if failed:
-        print(f"Done — {sent} entries sent, {failed} failed. "
-              f"{date_str} left unsent so it retries later.")
+    results = send_to_kimai(config, date_str, entries)
+    total_sent = sum(r[0] for r in results.values())
+    total_failed = sum(r[1] for r in results.values())
+    for source, (sent, failed, settled) in sorted(results.items()):
+        if settled and not failed:
+            mark_source_sent(date_str, source)
+        elif not settled:
+            print(f"  {source}: no data yet, left outstanding so it retries later.")
+    if total_failed:
+        print(f"Done — {total_sent} entries sent, {total_failed} failed. "
+              f"The failed sources stay outstanding so they retry later.")
     else:
-        mark_date_sent(date_str)
-        print(f"Done — {sent} entries sent.")
+        print(f"Done — {total_sent} entries sent.")
 
 
 def cmd_sync_android(date_str: str):
@@ -634,7 +716,13 @@ def cmd_send_android(date_str: str):
     meetings = _sync_meetings(config, date_str)
     print(f"Sending phone time for {date_str} (clipping against {len(mac)} Mac "
           f"entries and {len(meetings)} meetings already in Kimai)...")
-    sent, failed = _send_android(config, date_str, mac, meetings, mappings)
+    sent, failed, settled = _send_android(config, date_str, mac, meetings, mappings)
+    if not settled:
+        print(f"No phone data stored for {date_str} yet — nothing sent. "
+              f"RescueTime may not have uploaded it.")
+        return
+    if not failed:
+        mark_source_sent(date_str, SOURCE_ANDROID)
     print(f"Done — {sent} phone entries sent, {failed} failed.")
 
 
@@ -652,7 +740,15 @@ class Tracker:
         self.is_idle: bool = False
         self._idle_probe_failing: bool = False
         self.current_date = datetime.date.today()
-        self.sent_dates = load_sent_dates()
+        if sent_state_is_legacy():
+            backup = backup_sent_state()
+            log.info(f"sent_dates.json is in the pre-per-source format; copied to "
+                     f"{os.path.basename(backup)} before migrating. Every day in it "
+                     f"is recorded as fully sent, so none is revisited.")
+            self.sent_state = load_sent_state()
+            save_sent_state(self.sent_state)
+        else:
+            self.sent_state = load_sent_state()
 
         self._kimai_active_cache: bool = False
         self._kimai_last_check: datetime.datetime = (
@@ -662,52 +758,59 @@ class Tracker:
         signal.signal(signal.SIGTERM, self._on_shutdown)
         signal.signal(signal.SIGINT, self._on_shutdown)
 
-    def _android_hold(self, date_str: str) -> bool:
-        """True while a finished day should still wait before being sent.
-        Local time throughout, matching how log files are named.
+    def _reload_config(self):
+        """Re-read config.json, keeping the previous values if it cannot be read.
 
-        Two separate reasons to wait. The upload lag: RescueTime's free tier
-        uploads on a 30-minute cycle, so sending at 00:00 misses the last
-        stretch of phone use. And the phone data not having arrived at all: the
-        Mac batch and the phone batch go to Kimai in a single pass, and
-        `sent_dates` has no per-source dimension, so a day sent without its
-        phone time can never have that time added afterwards. Holding is the
-        only thing that stops it being lost silently.
-
-        The wait is bounded by ANDROID_MAX_HOLD_DAYS, after which the day goes
-        Mac-only with an error in the log.
+        The daemon used to read config once, in __init__, so a value corrected
+        while it ran had no effect until the process was restarted. A corrected
+        kimai_timezone was therefore ignored for as long as the process lived,
+        and every entry written in that time went in against the old zone.
         """
+        try:
+            self.config = common.load_config()
+        except Exception as e:
+            log.error(f"Could not re-read config.json, keeping the previous "
+                      f"values: {e}")
+        return self.config
+
+    def _android_ready(self, date_str: str) -> bool:
+        """False while the phone's day is too fresh to be worth fetching.
+        RescueTime's free tier uploads on a 30-minute cycle, so asking at 00:00
+        spends a call on a day that is not there yet. This gates the phone
+        source only: the Mac side never waits on it."""
         if not self.config.get("android_sync_enabled"):
             return False
         try:
             delay = int(self.config.get("android_sync_delay_minutes", 45))
             day = datetime.date.fromisoformat(date_str)
         except (TypeError, ValueError):
-            return False
+            return True
         ready_at = (datetime.datetime.combine(day, datetime.time.min)
                     + datetime.timedelta(days=1, minutes=delay))
-        if datetime.datetime.now() < ready_at:
-            return True
-        if has_android_data(date_str):
-            return False
-        # Past the lag with nothing stored means the fetch never landed. Pull it
-        # here rather than at send time: sync_day writes the day on success,
-        # including a day with no phone use at all, which stores an empty list
-        # and so reads as "asked and answered" rather than "never asked".
+        return datetime.datetime.now() >= ready_at
+
+    def _phone_aged_out(self, date_str: str) -> bool:
+        """True once a day is older than RescueTime will serve, so its phone
+        time can never be fetched and retrying it is noise."""
         try:
-            import android_sync
-            android_sync.sync_day(self.config, date_str)
-        except Exception as e:
-            log.error(f"Android pre-fetch failed for {date_str}: {e}")
-        if has_android_data(date_str):
+            day = datetime.date.fromisoformat(date_str)
+        except ValueError:
             return False
-        if datetime.datetime.now() < ready_at + datetime.timedelta(days=ANDROID_MAX_HOLD_DAYS):
-            log.warning(f"{date_str}: no phone data yet, holding the day")
-            return True
-        log.error(f"{date_str}: still no phone data after {ANDROID_MAX_HOLD_DAYS} "
-                  f"days — sending Mac time only. Phone time for this day is lost; "
-                  f"recover it with --send-android once RescueTime has it.")
-        return False
+        return (datetime.date.today() - day).days > PHONE_HISTORY_DAYS
+
+    def _outstanding(self, date_str: str) -> set:
+        """Sources for this day that have not reached Kimai yet."""
+        want = {SOURCE_MAC}
+        if self.config.get("android_sync_enabled"):
+            want.add(SOURCE_ANDROID)
+        pending = want - self.sent_state.get(date_str, set())
+        if SOURCE_ANDROID in pending and not self._android_ready(date_str):
+            pending.discard(SOURCE_ANDROID)
+        return pending
+
+    def _record(self, date_str: str, source: str):
+        mark_source_sent(date_str, source)
+        self.sent_state.setdefault(date_str, set()).add(source)
 
     def _min_duration_for(self, source: str) -> int:
         configured = self.config.get("min_duration_seconds", {})
@@ -795,29 +898,13 @@ class Tracker:
         today = datetime.date.today()
         if today == self.current_date:
             return
-        # Day rolled over — send yesterday's log
         yesterday = self.current_date.isoformat()
-        if yesterday not in self.sent_dates and self._android_hold(yesterday):
-            # RescueTime's free tier uploads on a 30-minute cycle, so sending at
-            # 00:00 would miss the last stretch of phone use, and sent_dates has
-            # no per-source dimension to let it be added later. Let the hourly
-            # _send_missed_days sweep pick the day up once the data has landed.
-            log.info(f"Midnight rollover — holding {yesterday} for the phone upload lag")
-            self.current_date = today
-            return
-        if yesterday not in self.sent_dates:
-            log.info(f"Midnight rollover — sending {yesterday}")
-            path = log_path_for(self.current_date)
-            entries = load_entries(path)
-            if entries:
-                try:
-                    sent, failed = send_to_kimai(self.config, yesterday, entries)
-                    self._settle_send(yesterday, sent, failed)
-                except Exception as e:
-                    log.error(f"Failed to send {yesterday}: {e}")
-        # Always advance the date, even if the send failed — otherwise the
-        # rollover re-fires on every poll. Unsent days are retried by
-        # _send_missed_days instead.
+        self._reload_config()
+        log.info(f"Midnight rollover — settling {yesterday}")
+        self._send_day(yesterday)
+        # Always advance the date, even when a source is left outstanding —
+        # otherwise the rollover re-fires on every poll. Outstanding sources are
+        # retried by _send_missed_days.
         self.current_date = today
 
     def _on_shutdown(self, signum, frame):
@@ -907,50 +994,174 @@ class Tracker:
             time.sleep(POLL_INTERVAL)
 
     def _send_missed_days(self):
-        """Send any log files that were never sent (e.g. if daemon was off at midnight)."""
+        """Settle every finished day that still has a source outstanding."""
+        self._reload_config()
+        common.check_kimai_timezone(self.config)
         today = datetime.date.today().isoformat()
         dates = {f[:-5] for f in os.listdir(LOGS_DIR) if f.endswith(".json")}
         if self.config.get("android_sync_enabled"):
-            # Only when the sync is on: a stored phone log left over from when it
-            # was enabled would otherwise surface a day the send guard below
-            # refuses to handle, and the sweep would re-announce it every hour.
             dates |= android_dates()
         for date_str in sorted(dates):
             if date_str >= today:
                 continue  # don't send today's partial log
-            if date_str in self.sent_dates:
-                continue
-            if self._android_hold(date_str):
-                continue
-            log.info(f"Found unsent log for {date_str}, sending...")
-            entries = load_entries(os.path.join(LOGS_DIR, f"{date_str}.json"))
-            if entries or self.config.get("android_sync_enabled"):
-                try:
-                    sent, failed = send_to_kimai(self.config, date_str, entries)
-                    self._settle_send(date_str, sent, failed)
-                except Exception as e:
-                    log.error(f"Failed to send missed day {date_str}: {e}")
+            self._send_day(date_str)
 
-    def _settle_send(self, date_str: str, sent: int, failed: int) -> bool:
-        """Decide whether a send counts as done. Returns True if the day was
-        marked sent.
+    def _send_day(self, date_str: str):
+        """Send whichever of the day's sources have not reached Kimai yet.
 
-        A day is only left unsent when *nothing* got through — the network-down
-        case, which is safe to retry wholesale. A partial failure is marked sent
-        anyway: re-sending would duplicate the entries that did land, so the
-        stragglers are logged for manual entry instead."""
+        The two are settled independently, so a day whose Mac time went at
+        midnight can still have its phone time added days later without
+        re-sending anything.
+        """
+        pending = self._outstanding(date_str)
+
+        if SOURCE_ANDROID in pending and self._phone_aged_out(date_str):
+            log.error(f"{date_str}: the phone data never arrived and the day is "
+                      f"now past RescueTime's {PHONE_HISTORY_DAYS}-day history, "
+                      f"so it can no longer be fetched. Recording it as done; "
+                      f"that day's phone time is lost.")
+            self._record(date_str, SOURCE_ANDROID)
+            pending.discard(SOURCE_ANDROID)
+
+        if not pending:
+            return
+
+        entries = load_entries(os.path.join(LOGS_DIR, f"{date_str}.json"))
+        if SOURCE_MAC in pending and not entries:
+            # No log file, or an empty one: nothing was captured that day, so
+            # there is nothing to send and nothing to keep retrying.
+            self._record(date_str, SOURCE_MAC)
+            pending.discard(SOURCE_MAC)
+            if not pending:
+                return
+
+        log.info(f"{date_str}: sending {', '.join(sorted(pending))}")
+        try:
+            results = send_to_kimai(self.config, date_str, entries, sources=pending)
+        except Exception as e:
+            log.error(f"Failed to send {date_str}: {e}")
+            return
+        for source, (sent, failed, settled) in results.items():
+            self._settle_source(date_str, source, sent, failed, settled)
+
+    def _settle_source(self, date_str: str, source: str, sent: int, failed: int,
+                       settled: bool) -> bool:
+        """Decide whether one source of one day counts as done.
+
+        A source is left outstanding when nothing got through, which is the
+        network-down case and safe to retry wholesale, or when it cannot be
+        judged yet, which is the phone data not having arrived. A partial
+        failure is recorded as sent anyway: re-sending would duplicate the
+        entries that did land, so the stragglers are logged instead.
+        """
+        if not settled:
+            log.info(f"{date_str}: {source} data has not arrived yet, will retry")
+            return False
         if failed and not sent:
-            log.warning(f"{date_str}: all {failed} entries failed to send — will retry")
+            log.warning(f"{date_str}: all {failed} {source} entries failed to "
+                        f"send — will retry")
             return False
         if failed:
             log.error(
-                f"{date_str}: {sent} sent but {failed} failed. Marking sent to avoid "
-                f"duplicating the {sent} that landed — add the failures manually "
-                f"(see the 'Kimai' errors above)."
+                f"{date_str}: {source}: {sent} sent but {failed} failed. Recording "
+                f"as sent to avoid duplicating the {sent} that landed — add the "
+                f"failures manually (see the 'Kimai' errors above)."
             )
-        mark_date_sent(date_str)
-        self.sent_dates.add(date_str)
+        self._record(date_str, source)
         return True
+
+
+# ---------------------------------------------------------------------------
+# Self-test
+# ---------------------------------------------------------------------------
+
+def cmd_self_test() -> int:
+    """Exercise the send-state logic against a temporary state file. No network,
+    no Kimai, nothing written outside a temp directory."""
+    import tempfile
+
+    global SENT_FILE
+    real_sent_file = SENT_FILE
+    results = []
+
+    def check(name, got, want):
+        results.append((name, got == want, got, want))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        SENT_FILE = os.path.join(tmp, "sent_dates.json")
+
+        # the legacy format migrates to both sources, so nothing is revisited
+        with open(SENT_FILE, "w") as f:
+            json.dump(["2026-09-01", "2026-09-02"], f)
+        check("legacy detected", sent_state_is_legacy(), True)
+        state = load_sent_state()
+        check("legacy migrates to both sources",
+              state["2026-09-01"], {SOURCE_MAC, SOURCE_ANDROID})
+        backup_sent_state()
+        save_sent_state(state)
+        check("after migrating, no longer legacy", sent_state_is_legacy(), False)
+        check("round-trips", load_sent_state()["2026-09-02"],
+              {SOURCE_MAC, SOURCE_ANDROID})
+
+        # one source at a time
+        mark_source_sent("2026-09-03", SOURCE_MAC)
+        check("records one source", load_sent_state()["2026-09-03"], {SOURCE_MAC})
+        mark_source_sent("2026-09-03", SOURCE_ANDROID)
+        check("tops up the other later", load_sent_state()["2026-09-03"],
+              {SOURCE_MAC, SOURCE_ANDROID})
+
+        t = object.__new__(Tracker)
+        t.sent_state = load_sent_state()
+
+        # what is outstanding, with the phone off and on
+        t.config = {"android_sync_enabled": False}
+        check("phone off: fresh day wants mac only",
+              t._outstanding("2026-08-01"), {SOURCE_MAC})
+        check("phone off: settled day wants nothing",
+              t._outstanding("2026-09-03"), set())
+
+        t.config = {"android_sync_enabled": True, "android_sync_delay_minutes": 45}
+        old_day = (datetime.date.today() - datetime.timedelta(days=3)).isoformat()
+        check("phone on: old day wants both",
+              t._outstanding(old_day), {SOURCE_MAC, SOURCE_ANDROID})
+        t.sent_state[old_day] = {SOURCE_MAC}
+        check("mac already sent leaves the phone outstanding",
+              t._outstanding(old_day), {SOURCE_ANDROID})
+
+        # today is still inside the upload delay, so the phone is not asked yet
+        today = datetime.date.today().isoformat()
+        check("phone not asked before the upload delay",
+              t._outstanding(today), {SOURCE_MAC})
+
+        # ageing out
+        check("recent day has not aged out", t._phone_aged_out(old_day), False)
+        gone = (datetime.date.today()
+                - datetime.timedelta(days=PHONE_HISTORY_DAYS + 1)).isoformat()
+        check("day past the history window has aged out",
+              t._phone_aged_out(gone), True)
+
+        # settling
+        t.sent_state = {}
+        check("unsettled source is not recorded",
+              t._settle_source("2026-09-05", SOURCE_ANDROID, 0, 0, False), False)
+        check("  and stays outstanding", "2026-09-05" in load_sent_state(), False)
+        check("total failure is not recorded",
+              t._settle_source("2026-09-05", SOURCE_MAC, 0, 3, True), False)
+        check("partial failure is recorded to avoid duplicates",
+              t._settle_source("2026-09-05", SOURCE_MAC, 4, 1, True), True)
+        check("clean send is recorded",
+              t._settle_source("2026-09-06", SOURCE_MAC, 4, 0, True), True)
+        check("  and only that source",
+              load_sent_state()["2026-09-06"], {SOURCE_MAC})
+
+    SENT_FILE = real_sent_file
+    failed = [r for r in results if not r[1]]
+    for name, ok, got, want in results:
+        print(f"  {'ok  ' if ok else 'FAIL'} {name}")
+        if not ok:
+            print(f"         got {got!r}, wanted {want!r}")
+    print(f"\n{len(results) - len(failed)}/{len(results)} passed")
+    return 1 if failed else 0
 
 
 # ---------------------------------------------------------------------------
@@ -967,6 +1178,8 @@ if __name__ == "__main__":
             cmd_sync_android(sys.argv[2] if len(sys.argv) == 3 else datetime.date.today().isoformat())
         elif sys.argv[1] == "--send-android" and len(sys.argv) == 3:
             cmd_send_android(sys.argv[2])
+        elif sys.argv[1] == "--self-test":
+            sys.exit(cmd_self_test())
         elif sys.argv[1] == "--list-projects":
             cmd_list_projects()
         elif sys.argv[1] == "--list-activities":
