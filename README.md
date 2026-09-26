@@ -339,11 +339,13 @@ midnight while `android_sync_enabled` is on — it waits `android_sync_delay_min
 last stretch of phone use would be missed, and `sent_dates.json` has no per-source
 dimension that would let it be added afterwards.
 
-Past that delay the day waits again if the phone data still has not arrived, because
-a day sent Mac-only can never have its phone time added later. The catch-up sweep
-retries the fetch each hour for up to two days, then sends the day without the phone
-side and logs an error saying so. A day the phone genuinely wasn't used stores an
-empty log, so it is never mistaken for a fetch that failed.
+The Mac and phone halves of a day are settled independently, so Mac time never waits
+on the phone. `sent_dates.json` records which sources have reached Kimai for each day,
+and the hourly sweep retries only what is outstanding. A day whose phone data arrives
+late has its phone batch added then, without re-sending or duplicating anything. A day
+the phone genuinely wasn't used stores an empty log, so it settles rather than being
+retried. If the data never arrives, the phone source is closed once the day passes
+RescueTime's two-week history, with an error saying that time is lost.
 
 ## Privacy / blocklist
 
