@@ -1077,11 +1077,19 @@ class Tracker:
 
 def cmd_self_test() -> int:
     """Exercise the send-state logic against a temporary state file. No network,
-    no Kimai, nothing written outside a temp directory."""
+    no Kimai, nothing written outside a temp directory.
+
+    Logging is silenced for the duration: these cases deliberately drive the
+    failure paths, and their WARNING and ERROR lines would otherwise land in
+    tracker.log looking exactly like real send failures on real dates. Fixture
+    dates are in 1999 for the same reason, so nothing here can be mistaken for
+    a day that exists.
+    """
     import tempfile
 
     global SENT_FILE
     real_sent_file = SENT_FILE
+    logging.disable(logging.CRITICAL)
     results = []
 
     def check(name, got, want):
@@ -1092,22 +1100,22 @@ def cmd_self_test() -> int:
 
         # the legacy format migrates to both sources, so nothing is revisited
         with open(SENT_FILE, "w") as f:
-            json.dump(["2026-09-01", "2026-09-02"], f)
+            json.dump(["1999-01-01", "1999-01-02"], f)
         check("legacy detected", sent_state_is_legacy(), True)
         state = load_sent_state()
         check("legacy migrates to both sources",
-              state["2026-09-01"], {SOURCE_MAC, SOURCE_ANDROID})
+              state["1999-01-01"], {SOURCE_MAC, SOURCE_ANDROID})
         backup_sent_state()
         save_sent_state(state)
         check("after migrating, no longer legacy", sent_state_is_legacy(), False)
-        check("round-trips", load_sent_state()["2026-09-02"],
+        check("round-trips", load_sent_state()["1999-01-02"],
               {SOURCE_MAC, SOURCE_ANDROID})
 
         # one source at a time
-        mark_source_sent("2026-09-03", SOURCE_MAC)
-        check("records one source", load_sent_state()["2026-09-03"], {SOURCE_MAC})
-        mark_source_sent("2026-09-03", SOURCE_ANDROID)
-        check("tops up the other later", load_sent_state()["2026-09-03"],
+        mark_source_sent("1999-01-03", SOURCE_MAC)
+        check("records one source", load_sent_state()["1999-01-03"], {SOURCE_MAC})
+        mark_source_sent("1999-01-03", SOURCE_ANDROID)
+        check("tops up the other later", load_sent_state()["1999-01-03"],
               {SOURCE_MAC, SOURCE_ANDROID})
 
         t = object.__new__(Tracker)
@@ -1116,9 +1124,9 @@ def cmd_self_test() -> int:
         # what is outstanding, with the phone off and on
         t.config = {"android_sync_enabled": False}
         check("phone off: fresh day wants mac only",
-              t._outstanding("2026-08-01"), {SOURCE_MAC})
+              t._outstanding("1999-01-04"), {SOURCE_MAC})
         check("phone off: settled day wants nothing",
-              t._outstanding("2026-09-03"), set())
+              t._outstanding("1999-01-03"), set())
 
         t.config = {"android_sync_enabled": True, "android_sync_delay_minutes": 45}
         old_day = (datetime.date.today() - datetime.timedelta(days=3)).isoformat()
@@ -1143,18 +1151,19 @@ def cmd_self_test() -> int:
         # settling
         t.sent_state = {}
         check("unsettled source is not recorded",
-              t._settle_source("2026-09-05", SOURCE_ANDROID, 0, 0, False), False)
-        check("  and stays outstanding", "2026-09-05" in load_sent_state(), False)
+              t._settle_source("1999-01-05", SOURCE_ANDROID, 0, 0, False), False)
+        check("  and stays outstanding", "1999-01-05" in load_sent_state(), False)
         check("total failure is not recorded",
-              t._settle_source("2026-09-05", SOURCE_MAC, 0, 3, True), False)
+              t._settle_source("1999-01-05", SOURCE_MAC, 0, 3, True), False)
         check("partial failure is recorded to avoid duplicates",
-              t._settle_source("2026-09-05", SOURCE_MAC, 4, 1, True), True)
+              t._settle_source("1999-01-05", SOURCE_MAC, 4, 1, True), True)
         check("clean send is recorded",
-              t._settle_source("2026-09-06", SOURCE_MAC, 4, 0, True), True)
+              t._settle_source("1999-01-06", SOURCE_MAC, 4, 0, True), True)
         check("  and only that source",
-              load_sent_state()["2026-09-06"], {SOURCE_MAC})
+              load_sent_state()["1999-01-06"], {SOURCE_MAC})
 
     SENT_FILE = real_sent_file
+    logging.disable(logging.NOTSET)
     failed = [r for r in results if not r[1]]
     for name, ok, got, want in results:
         print(f"  {'ok  ' if ok else 'FAIL'} {name}")
