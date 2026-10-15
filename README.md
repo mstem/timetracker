@@ -388,24 +388,6 @@ All keys below are optional and have built-in defaults — omit any you don't ne
 - **`android_sync_enabled` / `rescuetime_api_key` / `rescuetime_timezone` / `android_sync_delay_minutes`**: phone tracking, see [Android tracking](#android-tracking-optional). `rescuetime_timezone` is required when the sync is on and is **not** interchangeable with `kimai_timezone`.
 - **`generic_domains`**: Chrome domains that are pure auth infrastructure — a sign-in screen never carries project signal, so these are never even sent to Claude. These are exact matches (unlike `blocked_domains`/`video_domains`, which also match subdomains), so `accounts.google.com` won't swallow `docs.google.com` or `calendar.google.com` — those still get classified normally when the tab title names something specific. Search engines (`google.com`, etc.) are deliberately **not** in this list by default — their titles can carry real signal — but note the tradeoff: the mapping key is per-domain, so a single confident match caches and applies to every future search on that domain too, including unrelated ones. Add search domains back to `generic_domains` yourself if that risk isn't worth it for you.
 
-## Stop time to exist.io (optional)
-
-`exist_sync.py` sends the time you stopped work to an [exist.io](https://exist.io) time-of-day attribute, so the day's finish sits alongside your mood, sleep and activity data. The tracker already knows it: a span ends at the last keyboard or mouse input before the machine went idle.
-
-It sends the end of the last span before the **evening break**, not the last span of the day, so an hour back at the laptop after dinner doesn't move the finish time. The day is cut at the first gap of `exist_dinner_gap_minutes` (default 60) starting after `exist_earliest_stop_hour` (default 15), and `exist_padding_minutes` (default 5) is added to the result. Video playback is dropped before the gap search, so a film doesn't read as work.
-
-Writing to exist.io needs an OAuth2 client: simple tokens minted from a username and password are read-only, and every write endpoint refuses them. Register a client under **Developer apps** on your [exist.io account page](https://exist.io/account/), run its authorisation flow with the `productivity_read productivity_write` scopes, and put the resulting access token in the environment as `EXIST_WRITE_TOKEN`.
-
-```bash
-export EXIST_WRITE_TOKEN=...
-python3 exist_sync.py --setup      # create and acquire the attribute, once
-python3 exist_sync.py --dry-run    # print today's stop time, send nothing
-python3 exist_sync.py              # send today
-python3 exist_sync.py --date 2026-09-20
-```
-
-`--setup` prints the attribute name exist.io assigned, which goes in `config.json` as `exist_attribute_name`. To run it daily, point a launchd agent at `run_exist_sync.sh`, which loads the token and calls the script.
-
 ## Watchdogs (optional)
 
 Since the tracker runs silently in the background, it's easy to not notice if it stops working. Two launchd agents alert you via a Telegram bot when something's wrong:

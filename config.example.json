@@ -29,11 +29,6 @@
   "rescuetime_timezone": "<the timezone set in your RescueTime account, e.g. Europe/Lisbon. Required when android_sync_enabled is true. Not the same setting as kimai_timezone>",
   "android_sync_delay_minutes": 45,
 
-  "exist_attribute_name": "<exist.io attribute name, from exist_sync.py --setup>",
-  "exist_dinner_gap_minutes": 60,
-  "exist_earliest_stop_hour": 15,
-  "exist_padding_minutes": 5,
-
   "blocked_apps": [],
   "blocked_domains": [],
   "video_apps": ["zoom.us", "FaceTime", "QuickTime Player", "VLC"],
