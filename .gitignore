@@ -31,3 +31,6 @@ TimeTracker.app/Contents/_CodeSignature/
 __pycache__/
 *.pyc
 .DS_Store
+
+# Personal Toggl history (private data, never commit)
+toggl-archive/
