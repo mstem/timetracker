@@ -9,8 +9,9 @@ are refused, since that would count the same entries twice.
 Every CSV column is stored verbatim, plus the source file and the line the
 record starts on, so any row can be traced back to the export it came from.
 
-Exports of a shared workspace include other members' entries. They are kept,
-and per-member totals are in source_members; filter on email for one person.
+Exports of a shared workspace include other members' entries. Only rows
+whose Email matches toggl-archive/owner.txt are loaded; the others stay in the
+raw CSVs and are counted in sources.skipped_rows.
 """
 import csv
 import glob
@@ -23,6 +24,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ARCHIVE = os.path.join(HERE, "toggl-archive")
 RAW = os.path.join(ARCHIVE, "raw")
 DB = os.path.join(ARCHIVE, "toggl.sqlite")
+OWNER_FILE = os.path.join(ARCHIVE, "owner.txt")
 
 EXPECTED = ["Description", "Duration", "Member", "Email", "Project",
             "Tags", "Start date", "Stop date"]
@@ -45,10 +47,9 @@ def seconds(duration, where):
     return h * 3600 + mi * 60 + s
 
 
-def load(con, path):
+def load(con, path, owner):
     name = os.path.basename(path)
-    members = {}
-    n = total = 0
+    n = total = skipped = 0
     first = last = None
     with open(path, encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
@@ -56,15 +57,16 @@ def load(con, path):
             raise ImportError_(f"{name}: unexpected columns {reader.fieldnames}")
         start_line = reader.line_num + 1
         for row in reader:
-            n += 1
             secs = seconds(row["Duration"], f"{name} line {start_line}")
+            if row["Email"].strip().lower() != owner:
+                skipped += 1
+                start_line = reader.line_num + 1
+                continue
+            n += 1
             total += secs or 0
             d = row["Start date"]
             first = d if first is None or d < first else first
             last = d if last is None or d > last else last
-            key = (row["Email"], row["Member"])
-            r, s = members.get(key, (0, 0))
-            members[key] = (r + 1, s + (secs or 0))
             con.execute(
                 "INSERT INTO entries (source_file, source_line, description,"
                 " duration, duration_seconds, member, email, project, tags,"
@@ -73,12 +75,9 @@ def load(con, path):
                  secs, row["Member"], row["Email"], row["Project"],
                  row["Tags"], row["Start date"], row["Stop date"]))
             start_line = reader.line_num + 1
-    con.execute("INSERT INTO sources VALUES (?,?,?,?,?)",
-                (name, n, total, first, last))
-    for (email, member), (r, s) in members.items():
-        con.execute("INSERT INTO source_members VALUES (?,?,?,?,?)",
-                    (name, email, member, r, s))
-    return name, n, total, first, last, members
+    con.execute("INSERT INTO sources VALUES (?,?,?,?,?,?)",
+                (name, n, total, first, last, skipped))
+    return name, n, total, first, last, skipped
 
 
 def check_overlaps(con):
@@ -96,6 +95,12 @@ def main():
     files = sorted(glob.glob(os.path.join(RAW, "*.csv")))
     if not files:
         sys.exit(f"No CSVs in {RAW}")
+    try:
+        owner = open(OWNER_FILE).read().strip().lower()
+    except FileNotFoundError:
+        owner = ""
+    if not owner:
+        sys.exit(f"Put the Toggl account email to keep in {OWNER_FILE}")
 
     tmp = DB + ".tmp"
     if os.path.exists(tmp):
@@ -125,17 +130,11 @@ def main():
                 rows INTEGER,
                 total_seconds INTEGER,
                 first_date TEXT,
-                last_date TEXT
-            );
-            CREATE TABLE source_members (
-                file TEXT,
-                email TEXT,
-                member TEXT,
-                rows INTEGER,
-                total_seconds INTEGER
+                last_date TEXT,
+                skipped_rows INTEGER
             );
         """)
-        report = [load(con, path) for path in files]
+        report = [load(con, path, owner) for path in files]
         check_overlaps(con)
         con.commit()
     except ImportError_ as e:
@@ -145,13 +144,10 @@ def main():
     con.close()
     os.replace(tmp, DB)
 
-    for name, n, total, first, last, members in report:
+    for name, n, total, first, last, skipped in report:
         span = f"{first} to {last}" if first else "no entries"
-        print(f"{name}: {n} rows, {total / 3600:.1f}h, {span}")
-        if len(members) > 1:
-            for (email, member), (r, s) in sorted(
-                    members.items(), key=lambda kv: -kv[1][1]):
-                print(f"    {member} <{email}>: {r} rows, {s / 3600:.1f}h")
+        other = f", {skipped} other people's rows skipped" if skipped else ""
+        print(f"{name}: {n} rows, {total / 3600:.1f}h, {span}{other}")
     print(f"Wrote {DB}")
 
 
