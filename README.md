@@ -202,6 +202,10 @@ Some keys mix many kinds of work: one Slack app holds several workspaces, `chrom
 
 The title is cleaned first: Claude Code's spinner, Slack's unread count, iTerm's window size, Chrome's memory warnings and tab-group marks are dropped so one window stays one key. Incognito windows are never named. A title the model answers null for is saved as null so it is not asked about again, and falls back to its base key's project before the default.
 
+Chrome entries record the active tab's title in front of the window's name and profile ("OKRs - Google Docs - EVENS - Google Chrome - Matt (evensfoundation.eu)"), since a window the user has named shows only that name in its title bar. Shared Google domains (Docs, Gmail, Calendar, Meet, Drive) plus claude.ai, GitHub and LinkedIn are split by title as well, because a domain says nothing about whose document or inbox it was. When a title names nothing, `profile_projects` files it by its Chrome profile, and the profile also overrules a title the model put under another organization.
+
+`context_keys` files an app whose window never says anything under the work around it: Granola goes to the Evens or CTFG project of the nearest Evens or CTFG time that day, or to Evens general bucket on a day with none.
+
 `classifier_hints` in `config.json` gives the model facts it cannot infer: which Chrome profile belongs to which organization, which Slack workspace is which. The prompt sends personal use to the Life projects (Reading, Messaging, Finances, HEALTH, Travel, Shopping) rather than to the default.
 
 ## Migrating from Clockify
