@@ -36,5 +36,8 @@
   "idle_threshold_seconds": 600,
   "video_idle_threshold_seconds": 7200,
   "min_duration_seconds": {"terminal": 1, "chrome": 60, "app": 60, "android": 120},
-  "generic_domains": ["accounts.google.com", "myaccount.google.com", "login.microsoftonline.com", "okta.com"]
+  "generic_domains": ["accounts.google.com", "myaccount.google.com", "login.microsoftonline.com", "okta.com"],
+  "title_split_keys": ["chrome:internal", "chrome:newtab", "app:slack", "~", "~/projects/todoist-triage"],
+  "title_split_prefixes": ["~/.claude"],
+  "classifier_hints": ["A Chrome window title ending '(example.org)' is the Example Org profile: Example Org work."]
 }

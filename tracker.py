@@ -440,14 +440,16 @@ def send_to_kimai(config: dict, date_str: str, entries: list, sources=None) -> d
     entries = subtract_meetings(entries, meetings)
 
     mappings = ai_matcher.classify_and_save(config, entries)
+    # The Mac side is filed per window title where the key alone cannot say
+    # what the work was. Split with the mappings the classifier just saved, so
+    # the keys it classified are the keys looked up below.
+    entries = common.split_by_title(entries, config, mappings)
     default_project = config.get("default_project_id")
     default_activity = config.get("default_activity_id")
 
     if SOURCE_MAC in sources:
         def resolve_mac(key: str):
-            mapping = mappings.get(key) or {}
-            return (mapping.get("project") or default_project,
-                    mapping.get("activity") or default_activity)
+            return common.resolve_mapping(key, mappings, default_project, default_activity)
 
         sent, failed = _post_groups(config, date_str,
                                     aggregate_entries(entries), resolve_mac)
@@ -1161,6 +1163,54 @@ def cmd_self_test() -> int:
               t._settle_source("1999-01-06", SOURCE_MAC, 4, 0, True), True)
         check("  and only that source",
               load_sent_state()["1999-01-06"], {SOURCE_MAC})
+
+    # title-split keys: mixed keys are filed per window title
+    cfg = {"default_project_id": 53}
+    maps = {"chrome:nytimes.com": {"project": 61}, "app:todoist": {"project": 53}}
+    def keyed(e):
+        return common.entry_key(common.split_by_title([e], cfg, maps)[0])
+    check("Slack splits by workspace title, unread count dropped",
+          keyed({"source": "app", "key": "app:slack",
+                 "window": "Joe (DM) - Evens Foundation - 2 new items - Slack"}),
+          "app:slack | joe (dm) - evens foundation - slack")
+    check("an unreadable Chrome URL splits by window title",
+          keyed({"source": "chrome", "key": "chrome:internal",
+                 "window": "EVENS - Google Chrome - Matt (evensfoundation.eu)"}),
+          "chrome:internal | evens - google chrome - matt (evensfoundation.eu)")
+    check("a Claude session title loses its spinner",
+          keyed({"source": "terminal", "key": "~", "window": "\u2733 OLX buyer message triage"}),
+          "~ | olx buyer message triage")
+    check("a key pinned to the default project splits too",
+          keyed({"source": "app", "key": "app:todoist", "window": "Send WTF 1 pager to board \u2013 Todoist"}),
+          "app:todoist | send wtf 1 pager to board \u2013 todoist")
+    check("a title that names nothing keeps the base key",
+          keyed({"source": "app", "key": "app:slack", "window": "Slack"}), "app:slack")
+    check("a shell prompt keeps the base key",
+          keyed({"source": "terminal", "key": "~", "window": "-zsh"}), "~")
+    check("a key mapped to a real project is not split",
+          keyed({"source": "chrome", "key": "chrome:nytimes.com", "window": "Politics - NYT"}),
+          "chrome:nytimes.com")
+    check("memory warnings and group marks do not make new keys",
+          common.normalize_title("EVENS - Part of group \u231bClaude - High memory usage - 861 MB - Google Chrome - Matt (evensfoundation.eu)"),
+          common.normalize_title("EVENS - Part of group \u2705Claude - Google Chrome - Matt (evensfoundation.eu)"))
+    check("an incognito window is never named",
+          common.normalize_title("Tickets | MEO Blueticket - Google Chrome (Incognito)"), "")
+    check("a size-only terminal title names nothing",
+          common.normalize_title("\u2014 189\u2013544"), "")
+    check("a null title key falls back to its base key's project",
+          common.resolve_mapping("~/projects/x | lightning mode",
+                                 {"~/projects/x": {"project": 30, "activity": 29},
+                                  "~/projects/x | lightning mode": {"project": None}}, 53, 53),
+          (30, 29))
+    check("a base key pinned to the default does not count as a fallback",
+          common.resolve_mapping("app:todoist | today", {"app:todoist": {"project": 53}}, 53, 53),
+          (53, 53))
+    check("a key pinned to the default keeps its own activity",
+          common.resolve_mapping("app:x", {"app:x": {"project": 53, "activity": 70}}, 53, 53),
+          (53, 70))
+    check("phone entries are never split",
+          keyed({"source": "android", "key": "android:todoist", "window": "android:todoist"}),
+          "android:todoist")
 
     SENT_FILE = real_sent_file
     logging.disable(logging.NOTSET)

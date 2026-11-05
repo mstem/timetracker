@@ -32,6 +32,7 @@ LOG_FILE = os.path.join(common.BASE_DIR, "ai_matcher.log")
 
 DEFAULT_DAYS = 7
 SAMPLE_TITLES_PER_KEY = 5
+CLASSIFY_BATCH = 15
 
 # Sentinel returned from interactive prompts to signal "go back to previous item"
 GO_BACK = object()
@@ -92,6 +93,7 @@ def collect_unmapped_keys(days: int, mappings: dict, config: dict) -> dict:
                 log.warning(f"Could not read {path}: {exc}")
         if not entries:
             continue
+        entries = common.split_by_title(entries, config, mappings)
         for key, titles in collect_unmapped_keys_from_entries(entries, mappings, config).items():
             existing = merged.setdefault(key, [])
             for t in titles:
@@ -108,15 +110,22 @@ def collect_unmapped_keys(days: int, mappings: dict, config: dict) -> dict:
 def config_excluded_project_ids() -> list:
     """Kimai project ids the matcher must never propose (archived work).
 
-    Configured as `excluded_project_ids` in config.json.
+    Configured as `excluded_project_ids` in config.json. The default project
+    is excluded too: it is where unclassified time lands, so the model choosing
+    it is the same as answering null, only harder to spot.
     """
     try:
-        return common.load_config().get("excluded_project_ids", []) or []
+        config = common.load_config()
     except Exception:
         return []
+    ids = list(config.get("excluded_project_ids", []) or [])
+    if config.get("default_project_id") is not None:
+        ids.append(config["default_project_id"])
+    return ids
 
 
-def classify_keys_with_claude(api_key: str, unmapped: dict, projects: list, mappings: dict = None) -> dict:
+def classify_keys_with_claude(api_key: str, unmapped: dict, projects: list, mappings: dict = None,
+                              hints: list = None) -> dict:
     """
     Send all unmapped activity keys (with sample titles for context) + all
     project names to Claude in one call. Returns {key: project_id_or_None}.
@@ -125,7 +134,28 @@ def classify_keys_with_claude(api_key: str, unmapped: dict, projects: list, mapp
     included as calibration examples so Claude has a concrete sense of what
     "specific enough to map" looks like in this user's own data, rather than
     guessing from the project list alone.
+
+    Keys go in batches of CLASSIFY_BATCH: the answer repeats every key, and a
+    day of title keys runs past the reply's token cap in one call, which cuts
+    the JSON off and loses the whole batch.
     """
+    if len(unmapped) > CLASSIFY_BATCH:
+        items = list(unmapped.items())
+        merged = {}
+        errors = []
+        for i in range(0, len(items), CLASSIFY_BATCH):
+            try:
+                merged.update(classify_keys_with_claude(
+                    api_key, dict(items[i:i + CLASSIFY_BATCH]), projects, mappings, hints))
+            except Exception as e:
+                # One bad batch must not throw away the ones that worked; its
+                # keys stay unmapped and are asked again on the next send.
+                log.error(f"Classification batch {i // CLASSIFY_BATCH + 1} failed: {e}")
+                errors.append(e)
+        if errors and not merged:
+            # Every batch failed: a bad key or an outage, not a bad answer.
+            raise RuntimeError(f"All {len(errors)} classification batches failed: {errors[0]}")
+        return merged
     # Exclude archived projects. They stay visible in Kimai for historical
     # reporting, but offering them as candidates means old work keeps attracting
     # new entries. "Urban League / General" collected 83 hours this way.
@@ -179,12 +209,20 @@ def classify_keys_with_claude(api_key: str, unmapped: dict, projects: list, mapp
         "actually doing. An 'android:' key has no title and no URL behind it, only "
         "the app name, so it carries much weaker signal than the other forms: "
         "return null unless the app exists for exactly one project. "
+        "A key of the form '<key> | <window title>' is one window title from a "
+        "key that mixes many kinds of work (one Slack app for several "
+        "workspaces, Chrome windows whose URL could not be read, a terminal in "
+        "the home directory); classify it by that title alone. "
         "Reply ONLY with valid JSON. No markdown, no explanation, no code fences."
     )
 
+    hints_block = ""
+    if hints:
+        hints_block = "\nFacts about this user's setup:\n" + "\n".join(f"- {h}" for h in hints) + "\n"
+
     user = (
         "Match each activity key to the most appropriate Kimai project.\n"
-        f"{examples_block}\n"
+        f"{examples_block}{hints_block}\n"
         f"Activity keys to match, with sample titles seen for each:\n{json.dumps(unmapped, indent=2)}\n\n"
         f"Available Kimai projects ('Customer / Project' → id):\n{json.dumps(project_map, indent=2)}\n\n"
         "Rules:\n"
@@ -199,7 +237,9 @@ def classify_keys_with_claude(api_key: str, unmapped: dict, projects: list, mapp
         "title still has to name something specific (e.g. \"Q3 Marketing Plan - "
         "Google Docs\" is specific; \"Google Calendar\" or \"Sign in - Google "
         "accounts\" is not).\n"
-        "- Prefer null over a weak guess, even if some project seems plausible.\n- A project named \"General\", \"Misc\" or similar is NOT a catch-all. It belongs to the customer named before the slash, so only use it for that customer's work. Cross-cutting tools that serve every project (a chat client, a task manager, a terminal, a news site) belong to no project: return null.\n"
+        "- Prefer null over a weak guess, even if some project seems plausible.\n- A project named \"General\", \"Misc\" or similar is NOT a catch-all. It belongs to the customer named before the slash, so only use it for that customer's work. A work tool that serves every project (a task manager, a terminal, a notes app) belongs to no project unless the title names the work: return null.\n"
+        "- Personal life is not miscellaneous. The 'Life' projects exist for it: reading news or articles goes to Life / Reading, messaging friends to Life / Messaging, personal finance to Life / Finances, health and fitness to Life / HEALTH, trips to Life / Travel, shopping to Life / Shopping.\n"
+        "- A title that names an organisation's workspace, profile or window with no more specific project in it goes to that organisation's general project when it has one.\n"
         "- Every activity key in the input must appear as a key in your response.\n\n"
         "Respond with exactly this JSON structure:\n"
         '{"key1": "id_or_null", "key2": "id_or_null", ...}'
@@ -231,8 +271,10 @@ def classify_keys_with_claude(api_key: str, unmapped: dict, projects: list, mapp
         elif project_id in valid_ids:
             validated[key] = project_id
         else:
-            log.warning(f"Claude returned unknown project ID '{project_id}' for '{key}' — skipping")
-            validated[key] = None
+            # Left out rather than set to None: an id that failed validation
+            # is a bad answer, not a "nothing specific here", and a caller
+            # that stores nulls must not store this one.
+            log.warning(f"Claude returned unknown or excluded project ID '{project_id}' for '{key}' — skipping")
 
     return validated
 
@@ -286,6 +328,7 @@ def classify_and_save(config: dict, entries: list) -> dict:
     if not anthropic_key:
         return mappings
 
+    entries = common.split_by_title(entries, config, mappings)
     unmapped = collect_unmapped_keys_from_entries(entries, mappings, config)
     if not unmapped:
         return mappings
@@ -293,10 +336,16 @@ def classify_and_save(config: dict, entries: list) -> dict:
     try:
         projects = common.list_kimai_projects(config)
         resolve_activity = build_activity_resolver(config, common.list_kimai_activities(config))
-        matches = classify_keys_with_claude(anthropic_key, unmapped, projects, mappings)
+        matches = classify_keys_with_claude(anthropic_key, unmapped, projects, mappings,
+                                            config.get("classifier_hints"))
         to_save = {}
         for key, pid in matches.items():
             if not pid:
+                # A title key that names nothing specific will name nothing
+                # tomorrow either, so its null is kept rather than asked about
+                # on every send. A base key's null stays unsaved, as before.
+                if common.TITLE_SEP in key:
+                    to_save[key] = {"project": None, "activity": None}
                 continue
             activity_id = resolve_activity(pid)
             if not activity_id:
@@ -444,7 +493,8 @@ def cmd_match(days: int, dry_run: bool, interactive: bool):
     print_projects_by_client(projects)
     print(f"Asking Claude to match against {len(projects)} project(s)...\n")
     try:
-        matches = classify_keys_with_claude(anthropic_key, unmapped, projects, mappings)
+        matches = classify_keys_with_claude(anthropic_key, unmapped, projects, mappings,
+                                            config.get("classifier_hints"))
     except RuntimeError as e:
         print(f"ERROR: {e}")
         sys.exit(1)
