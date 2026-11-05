@@ -57,6 +57,11 @@ def collect_unmapped_keys_from_entries(entries: list, mappings: dict, config: di
         key = common.entry_key(e)
         if key in mappings:
             continue
+        if common.TITLE_SEP not in key and common.is_title_split(key, config, mappings):
+            # A split key's leftover entries are the ones whose title named
+            # nothing. Classifying the bare key would pin every future
+            # untitled tab on that domain to whatever this sample suggested.
+            continue
         if key.startswith("chrome:"):
             if common.is_generic_domain(key[len("chrome:"):], config):
                 continue

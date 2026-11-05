@@ -324,6 +324,28 @@ def is_noise_dirname(dirname: str) -> bool:
     return False
 
 
+_CHROME_PROFILE = re.compile(r"^(.*?) - Google Chrome( - .+)?$")
+
+
+def chrome_window_title(window_title: str, tab_title: str) -> str:
+    """The title to record for a Chrome window: the active tab's title, then
+    the window's own name when the user gave it one, then the profile.
+
+    "EVENS - Google Chrome - Matt (evensfoundation.eu)" with the OKRs doc in
+    front becomes "OKRs - Google Docs - EVENS - Google Chrome - Matt
+    (evensfoundation.eu)". The profile stays at the end, where the classifier
+    reads which organization the window belongs to."""
+    if not tab_title:
+        return window_title
+    m = _CHROME_PROFILE.match(window_title or "")
+    if not m:
+        return window_title
+    name, profile = m.group(1), m.group(2) or ""
+    if name == tab_title:
+        return window_title
+    return f"{tab_title} - {name} - Google Chrome{profile}"
+
+
 def chrome_domain(url: str) -> str:
     """Normalize a URL down to a bare domain, for use as a mapping key."""
     if not url:
@@ -403,7 +425,9 @@ TITLE_SEP = " | "
 # Claude Code puts a spinner glyph in front of the session name; Slack appends an
 # unread count; iTerm appends the window size. None of them name the work.
 _TITLE_LEAD = re.compile(r"^[\s\u2733\u25d0-\u25d3\u2800-\u28ff\u00b7\u2022*]+")
-_TITLE_UNREAD = re.compile(r"\s+-\s+\d+\s+new items?(?=\s+-\s)", re.I)
+# Slack's "- 2 new items", a tab's leading "(3) ", and Gmail's "Inbox (12)". A
+# number in brackets elsewhere ("Budget (2026)") is part of the name.
+_TITLE_UNREAD = re.compile(r"\s+-\s+\d+\s+new items?(?=\s+-\s)|^\(\d[\d,]*\)\s*|\s\(\d[\d,]*\)(?=\s-\s.*\bgmail\b)", re.I)
 _TITLE_SIZE = re.compile(r"\s*\u2014\s*\d+\s*[\u2715x\u00d7\u2013-]\s*\d+\s*$")
 # Chrome decorates the title with passing state: memory warnings, a network
 # error, the camera light, the tab group's status mark. None of it names the
@@ -431,18 +455,47 @@ def normalize_title(title: str) -> str:
     t = re.sub(r"\s+", " ", t).strip()
     if t.lower() in _GENERIC_TITLES or t.startswith("-") or len(t) <= 2:
         return ""
-    return normalize_key(t[:120])
+    if len(t) > 120:
+        # Shorten the front, never the end: a Chrome title ends with the
+        # profile, which is what profile_projects reads.
+        m = re.search(r" - Google Chrome( - .+)?$", t, re.I)
+        tail = m.group(0) if m else ""
+        t = t[: max(40, 120 - len(tail))].rstrip() + tail
+    return normalize_key(t)
 
 
-def resolve_mapping(key: str, mappings: dict, default_project, default_activity) -> tuple:
+def profile_mapping(key: str, config: dict) -> dict:
+    """The mapping for the Chrome profile named at the end of a title key, from
+    `profile_projects` in config.json, or {}. A Chrome title ends with its
+    profile ("- matt (evensfoundation.eu)"), and the profile says whose work
+    it was even when the rest of the title says nothing."""
+    if TITLE_SEP not in key or not key.startswith("chrome:"):
+        return {}
+    title = key.split(TITLE_SEP, 1)[1]
+    for rule in (config or {}).get("profile_projects", []):
+        if title.endswith(normalize_key(rule["suffix"])):
+            return rule
+    return {}
+
+
+def resolve_mapping(key: str, mappings: dict, default_project, default_activity,
+                    config: dict = None, project_customer: dict = None) -> tuple:
     """(project, activity) for a Mac key. A title key with no answer of its
-    own falls back to the key it was split from, then to the default: a
-    title that names nothing must not undo a mapping the base key already
-    had."""
+    own falls back to its Chrome profile, then to the key it was split from,
+    then to the default: a title that names nothing must not undo what the
+    profile or the base key already says.
+
+    The profile also settles the organization. A title's own mapping is kept
+    when it is a project of the profile's customer (an Evens window on the
+    Digital citizenry doc stays on Digital citizenry), and overruled when the
+    model put a work-profile window under another customer."""
     own = mappings.get(key) or {}
     base = mappings.get(key.split(TITLE_SEP, 1)[0]) or {}
-    for k in (key, key.split(TITLE_SEP, 1)[0]):
-        mapping = mappings.get(k) or {}
+    profile = profile_mapping(key, config)
+    if (profile and own.get("project") and project_customer
+            and project_customer.get(own["project"]) != project_customer.get(profile["project"])):
+        own = {}
+    for mapping in (own, profile, base):
         if mapping.get("project") and mapping["project"] != default_project:
             return mapping["project"], mapping.get("activity") or default_activity
     # A key deliberately pinned to the default project keeps its own activity.
@@ -453,6 +506,69 @@ def _split_lists(config: dict) -> tuple:
     keys = frozenset(normalize_key(k) for k in config.get("title_split_keys", DEFAULT_TITLE_SPLIT_KEYS))
     prefixes = tuple(normalize_key(p) for p in config.get("title_split_prefixes", DEFAULT_TITLE_SPLIT_PREFIXES))
     return keys, prefixes
+
+
+def assign_context(entries: list, config: dict, resolve, project_customer: dict) -> tuple:
+    """File time in a `context_keys` app (Granola) under the work going on
+    around it.
+
+    Granola's window says "Granola" and nothing else, but it is only ever open
+    for a meeting, and the meeting belongs to whichever organization the
+    nearest work in time belongs to. `context_keys` maps a key to the customer
+    ids it may land on, plus a fallback project for a day with no such work:
+    {"app:granola": {"customers": [4, 2], "fallback": {"project": 23, "activity": 22}}}.
+
+    Returns (entries, extra_mappings). Matching entries are re-keyed to
+    "<key> | context <project>" and extra_mappings resolves each new key; it is
+    meant for this send only and is never saved."""
+    rules = {normalize_key(k): v for k, v in (config.get("context_keys") or {}).items()}
+    if not rules:
+        return entries, {}
+    work = []
+    for e in entries:
+        k = entry_key(e)
+        if k.split(TITLE_SEP, 1)[0] in rules:
+            continue
+        project, activity = resolve(k)
+        work.append((e["start"], e["end"], project, activity))
+    out, extra = [], {}
+    for e in entries:
+        base = entry_key(e).split(TITLE_SEP, 1)[0]
+        rule = rules.get(base)
+        if not rule:
+            out.append(e)
+            continue
+        customers = set(rule.get("customers", []))
+        best = None
+        for start, end, project, activity in work:
+            if project_customer.get(project) not in customers:
+                continue
+            if end <= e["start"]:
+                gap = _seconds_between(end, e["start"])
+            elif start >= e["end"]:
+                gap = _seconds_between(e["end"], start)
+            else:
+                gap = 0
+            if best is None or gap < best[0]:
+                best = (gap, project, activity)
+        if best:
+            target = {"project": best[1], "activity": best[2]}
+        else:
+            target = rule.get("fallback") or {}
+        if target.get("project"):
+            key = f"{base}{TITLE_SEP}context {target['project']}"
+            extra[key] = target
+            e = {**e, "key": key}
+        out.append(e)
+    return out, extra
+
+
+def parse_z(ts: str) -> datetime.datetime:
+    return datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
+
+
+def _seconds_between(a: str, b: str) -> float:
+    return (parse_z(b) - parse_z(a)).total_seconds()
 
 
 def is_title_split(base_key: str, config: dict, mappings: dict) -> bool:

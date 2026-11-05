@@ -39,5 +39,7 @@
   "generic_domains": ["accounts.google.com", "myaccount.google.com", "login.microsoftonline.com", "okta.com"],
   "title_split_keys": ["chrome:internal", "chrome:newtab", "app:slack", "~", "~/projects/todoist-triage"],
   "title_split_prefixes": ["~/.claude"],
+  "profile_projects": [{"suffix": "(example.org)", "project": 23, "activity": 22}],
+  "context_keys": {"app:granola": {"customers": [4, 2], "fallback": {"project": 23, "activity": 22}}},
   "classifier_hints": ["A Chrome window title ending '(example.org)' is the Example Org profile: Example Org work."]
 }

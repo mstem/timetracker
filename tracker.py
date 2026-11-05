@@ -73,10 +73,14 @@ end tell
 return appName & (ASCII character 31) & winName
 '''
 
+# The tab's own title as well as its URL. A window the user has named
+# ("EVENS", "personal") shows that name in its title bar instead of the tab's,
+# so without this every tab in a named window looked the same.
 CHROME_URL_SCRIPT = '''
 tell application "Google Chrome"
     if (count of windows) > 0 then
-        return URL of active tab of front window
+        set t to active tab of front window
+        return (URL of t) & (ASCII character 31) & (title of t)
     else
         return ""
     end if
@@ -167,18 +171,18 @@ def get_frontmost():
     return (app_name, window_title) if app_name else None
 
 
-def get_chrome_url():
-    """Return the active Chrome tab's URL, or None."""
+def get_chrome_tab():
+    """Return the active Chrome tab's (URL, title), either of them None."""
     try:
         result = subprocess.run(
             ["osascript", "-e", CHROME_URL_SCRIPT],
             capture_output=True, text=True, timeout=3
         )
-        url = result.stdout.strip()
-        return common.strip_url_params(url) or None
+        url, _, title = result.stdout.rstrip("\n").partition("\x1f")
+        return common.strip_url_params(url.strip()) or None, title.strip() or None
     except Exception as e:
         log.debug(f"osascript chrome url error: {e}")
-        return None
+        return None, None
 
 
 def get_iterm_path():
@@ -219,7 +223,8 @@ def classify_frontmost(config: dict):
                 source = "app"
     elif app_name == "Google Chrome":
         source = "chrome"
-        url = get_chrome_url()
+        url, tab_title = get_chrome_tab()
+        window_title = common.chrome_window_title(window_title, tab_title)
         if window_title.endswith(CHROME_TITLE_SUFFIX):
             window_title = window_title[: -len(CHROME_TITLE_SUFFIX)]
     else:
@@ -347,8 +352,7 @@ def describe_group(key: str, group: dict) -> str:
     return max(group["titles"].items(), key=lambda kv: kv[1])[0]
 
 
-def _parse_z(ts: str) -> datetime.datetime:
-    return datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
+_parse_z = common.parse_z
 
 
 def subtract_intervals(entries: list, intervals: list) -> list:
@@ -448,11 +452,24 @@ def send_to_kimai(config: dict, date_str: str, entries: list, sources=None) -> d
     default_activity = config.get("default_activity_id")
 
     if SOURCE_MAC in sources:
+        # Not caught: if Kimai cannot list its projects it cannot take the
+        # timesheets either, and a send that fails is retried, where one that
+        # quietly filed Granola under the default would be recorded as done.
+        project_customer = ({p["id"]: p.get("customer") for p in common.list_kimai_projects(config)}
+                            if config.get("context_keys") or config.get("profile_projects") else {})
+
         def resolve_mac(key: str):
-            return common.resolve_mapping(key, mappings, default_project, default_activity)
+            return common.resolve_mapping(key, mappings, default_project, default_activity,
+                                          config, project_customer)
+
+        mac_entries = entries
+        if config.get("context_keys"):
+            mac_entries, extra = common.assign_context(entries, config, resolve_mac,
+                                                       project_customer)
+            mappings = {**mappings, **extra}
 
         sent, failed = _post_groups(config, date_str,
-                                    aggregate_entries(entries), resolve_mac)
+                                    aggregate_entries(mac_entries), resolve_mac)
         results[SOURCE_MAC] = (sent, failed, True)
 
     if SOURCE_ANDROID in sources:
@@ -1211,6 +1228,60 @@ def cmd_self_test() -> int:
     check("  and so do the titles split from it",
           common.resolve_mapping("app:x | some title", {"app:x": {"project": 53, "activity": 70}}, 53, 53),
           (53, 70))
+    check("Chrome records the tab inside a named window",
+          common.chrome_window_title("EVENS - Google Chrome - Matt (evensfoundation.eu)", "OKRs - Google Docs"),
+          "OKRs - Google Docs - EVENS - Google Chrome - Matt (evensfoundation.eu)")
+    check("an unnamed window is not doubled",
+          common.chrome_window_title("Inbox - stempeck@gmail.com - Gmail - Google Chrome - Matt",
+                                     "Inbox - stempeck@gmail.com - Gmail"),
+          "Inbox - stempeck@gmail.com - Gmail - Google Chrome - Matt")
+    check("Gmail's unread count does not make a new key",
+          common.normalize_title("Inbox (12) - stempeck@gmail.com - Gmail - Google Chrome - Matt"),
+          common.normalize_title("Inbox (3) - stempeck@gmail.com - Gmail - Google Chrome - Matt"))
+    pcfg = {"profile_projects": [{"suffix": "(evensfoundation.eu)", "project": 23, "activity": 22}]}
+    check("a title that names nothing falls back to its Chrome profile",
+          common.resolve_mapping("chrome:docs.google.com | untitled - google chrome - matt (evensfoundation.eu)",
+                                 {"chrome:docs.google.com | untitled - google chrome - matt (evensfoundation.eu)": {"project": None}},
+                                 53, 53, pcfg), (23, 22))
+    check("the personal profile does not match a work suffix",
+          common.resolve_mapping("chrome:docs.google.com | untitled - google chrome - matt", {}, 53, 53, pcfg),
+          (53, 53))
+    gcfg = {"context_keys": {"app:granola": {"customers": [4, 2], "fallback": {"project": 23, "activity": 22}}}}
+    pc = {63: 2, 23: 4, 61: 1}
+    gran = {"source": "app", "key": "app:granola", "window": "Granola",
+            "start": "1999-01-01T10:00:00Z", "end": "1999-01-01T10:30:00Z", "seconds": 1800}
+    near = {"source": "app", "key": "app:ctfg", "window": "x",
+            "start": "1999-01-01T10:35:00Z", "end": "1999-01-01T10:40:00Z", "seconds": 300}
+    far = {"source": "app", "key": "app:evens", "window": "x",
+           "start": "1999-01-01T13:00:00Z", "end": "1999-01-01T13:10:00Z", "seconds": 600}
+    news = {"source": "app", "key": "app:news", "window": "x",
+            "start": "1999-01-01T10:30:00Z", "end": "1999-01-01T10:31:00Z", "seconds": 60}
+    res_ = lambda k: {"app:ctfg": (63, 76), "app:evens": (23, 22), "app:news": (61, 61)}.get(k, (53, 53))
+    out, extra = common.assign_context([gran, near, far, news], gcfg, res_, pc)
+    check("Granola takes the nearest Evens or CTFG work, not the nearest anything",
+          extra.get(common.entry_key(out[0])), {"project": 63, "activity": 76})
+    out, extra = common.assign_context([gran, news], gcfg, res_, pc)
+    check("Granola with no work that day takes the fallback",
+          extra.get(common.entry_key(out[0])), {"project": 23, "activity": 22})
+    long_title = common.chrome_window_title("EVENS - Google Chrome - Matt (evensfoundation.eu)",
+        "Steering committee phase 2 presentation: notes and actions for the fourth quarter review - Google Docs")
+    check("a long tab title keeps its profile",
+          common.normalize_title(long_title).endswith("matt (evensfoundation.eu)"), True)
+    check("a year in brackets is part of the name",
+          common.normalize_title("Budget (2026) - Google Sheets - Google Chrome - Matt")
+          == common.normalize_title("Budget (2025) - Google Sheets - Google Chrome - Matt"), False)
+    check("a work profile overrules a title mapped to another customer",
+          common.resolve_mapping("chrome:x | doc - google chrome - matt (evensfoundation.eu)",
+                                 {"chrome:x | doc - google chrome - matt (evensfoundation.eu)": {"project": 63, "activity": 76}},
+                                 53, 53, pcfg, {63: 2, 23: 4, 20: 4}), (23, 22))
+    check("  but keeps a title mapped inside its own customer",
+          common.resolve_mapping("chrome:x | doc - google chrome - matt (evensfoundation.eu)",
+                                 {"chrome:x | doc - google chrome - matt (evensfoundation.eu)": {"project": 20, "activity": 19}},
+                                 53, 53, pcfg, {63: 2, 23: 4, 20: 4}), (20, 19))
+    gran_t = {**gran, "key": "app:granola | weekly leads"}
+    out, extra = common.assign_context([gran_t, near], gcfg, res_, pc)
+    check("a split Granola title still takes the nearest work",
+          extra.get(common.entry_key(out[0])), {"project": 63, "activity": 76})
     check("phone entries are never split",
           keyed({"source": "android", "key": "android:todoist", "window": "android:todoist"}),
           "android:todoist")
