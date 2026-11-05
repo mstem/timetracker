@@ -382,6 +382,113 @@ def entry_key(entry: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Title-split keys
+# ---------------------------------------------------------------------------
+#
+# Some keys mix many kinds of work under one name. One Slack app holds the Evens
+# and the CTFG (Superbloom) workspaces; `chrome:internal` holds every Chrome
+# window whose URL the tracker cannot read, which is most named windows
+# ("EVENS - Google Chrome - Matt (evensfoundation.eu)"); a home-directory
+# terminal holds whatever Claude session was started there. Mapped as one key,
+# each can only land on one project, and that project was Misc. For these the
+# window title is the signal, so each title becomes its own key:
+# "app:slack | joe (dm) - evens foundation - slack".
+
+DEFAULT_TITLE_SPLIT_KEYS = [
+    "chrome:internal", "chrome:newtab", "app:slack", "~", "~/projects/todoist-triage",
+]
+DEFAULT_TITLE_SPLIT_PREFIXES = ["~/.claude"]
+TITLE_SEP = " | "
+
+# Claude Code puts a spinner glyph in front of the session name; Slack appends an
+# unread count; iTerm appends the window size. None of them name the work.
+_TITLE_LEAD = re.compile(r"^[\s\u2733\u25d0-\u25d3\u2800-\u28ff\u00b7\u2022*]+")
+_TITLE_UNREAD = re.compile(r"\s+-\s+\d+\s+new items?(?=\s+-\s)", re.I)
+_TITLE_SIZE = re.compile(r"\s*\u2014\s*\d+\s*[\u2715x\u00d7\u2013-]\s*\d+\s*$")
+# Chrome decorates the title with passing state: memory warnings, a network
+# error, the camera light, the tab group's status mark. None of it names the
+# work, and left in, one window becomes a new key every few minutes.
+_TITLE_VOLATILE = [
+    re.compile(r"\s+-\s+high memory usage\s+-\s+[\d.,]+\s*[kmg]b", re.I),
+    re.compile(r"\s+-\s+(network error|camera and microphone recording|camera recording|microphone recording|audio playing)(?=\s+-\s)", re.I),
+    re.compile(r"[\u2300-\u23ff\u2600-\u27bf\u2b00-\u2bff\U0001f000-\U0001faff\ufe0f]"),
+]
+_GENERIC_TITLES = {"", "slack", "granola", "today", "beeper", "python", "bash", "zsh",
+                   "gh", "env", "id", "shelllauncher", "claude code", "new tab"}
+
+
+def normalize_title(title: str) -> str:
+    """The part of a window title that names the work, lowercased, or "" when
+    nothing in it does. An incognito window is never named: it stays out of
+    the mappings file and the model's prompt."""
+    if "(incognito)" in (title or "").lower():
+        return ""
+    t = _TITLE_LEAD.sub("", title or "")
+    t = _TITLE_UNREAD.sub("", t)
+    t = _TITLE_SIZE.sub("", t)
+    for pattern in _TITLE_VOLATILE:
+        t = pattern.sub("", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    if t.lower() in _GENERIC_TITLES or t.startswith("-") or len(t) <= 2:
+        return ""
+    return normalize_key(t[:120])
+
+
+def resolve_mapping(key: str, mappings: dict, default_project, default_activity) -> tuple:
+    """(project, activity) for a Mac key. A title key with no answer of its
+    own falls back to the key it was split from, then to the default: a
+    title that names nothing must not undo a mapping the base key already
+    had."""
+    own = mappings.get(key) or {}
+    base = mappings.get(key.split(TITLE_SEP, 1)[0]) or {}
+    for k in (key, key.split(TITLE_SEP, 1)[0]):
+        mapping = mappings.get(k) or {}
+        if mapping.get("project") and mapping["project"] != default_project:
+            return mapping["project"], mapping.get("activity") or default_activity
+    # A key deliberately pinned to the default project keeps its own activity.
+    return default_project, own.get("activity") or base.get("activity") or default_activity
+
+
+def _split_lists(config: dict) -> tuple:
+    keys = frozenset(normalize_key(k) for k in config.get("title_split_keys", DEFAULT_TITLE_SPLIT_KEYS))
+    prefixes = tuple(normalize_key(p) for p in config.get("title_split_prefixes", DEFAULT_TITLE_SPLIT_PREFIXES))
+    return keys, prefixes
+
+
+def is_title_split(base_key: str, config: dict, mappings: dict) -> bool:
+    """Whether time under `base_key` should be filed per window title.
+
+    True for the configured mixed keys, and for any key mapped straight to the
+    default project: a key that could only be sent to Misc as a whole is a key
+    whose titles are worth reading one by one."""
+    keys, prefixes = _split_lists(config)
+    if base_key in keys or base_key.startswith(prefixes):
+        return True
+    default = config.get("default_project_id")
+    mapping = mappings.get(base_key) or {}
+    return default is not None and mapping.get("project") == default
+
+
+def split_by_title(entries: list, config: dict, mappings: dict) -> list:
+    """Re-key Mac entries under a title-split key to `<key> | <title>`. Entries
+    whose title names nothing keep their base key. Returns new dicts; the log
+    entries themselves are not touched."""
+    out = []
+    decided = {}
+    for e in entries:
+        base = entry_key(e)
+        if base not in decided:
+            decided[base] = (TITLE_SEP not in base and not base.startswith("android:")
+                             and is_title_split(base, config, mappings))
+        if decided[base] and e.get("source") != "android":
+            title = normalize_title(e.get("window", ""))
+            if title:
+                e = {**e, "key": base + TITLE_SEP + title}
+        out.append(e)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Blocklist / video-context checks
 # ---------------------------------------------------------------------------
 

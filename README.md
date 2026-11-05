@@ -196,6 +196,14 @@ python3 ai_matcher.py --link app:Slack "Team Chat"
 - Keys where Claude returns no match remain unmapped and are retried next time
 - Two guards keep it conservative: domains in `generic_domains` (sign-in flows, bare search homepages — see [Configuration reference](#configuration-reference)) are never even sent to Claude, and your own already-confirmed mappings are included as calibration examples so it has a concrete sense of what "specific enough" looks like in your data, not just the raw project list
 
+### Keys split by window title
+
+Some keys mix many kinds of work: one Slack app holds several workspaces, `chrome:internal` and `chrome:newtab` hold every Chrome window whose URL the tracker cannot read (most named windows, such as `EVENS - Google Chrome - Matt (evensfoundation.eu)`), and a terminal in the home directory or a skills folder holds whatever Claude Code session ran there. Mapped as one key, each could only go to one project. These are filed per window title instead, as `<key> | <title>`, and each title is classified on its own. The list is `title_split_keys` and `title_split_prefixes` in `config.json`; any key mapped straight to the default project is split too.
+
+The title is cleaned first: Claude Code's spinner, Slack's unread count, iTerm's window size, Chrome's memory warnings and tab-group marks are dropped so one window stays one key. Incognito windows are never named. A title the model answers null for is saved as null so it is not asked about again, and falls back to its base key's project before the default.
+
+`classifier_hints` in `config.json` gives the model facts it cannot infer: which Chrome profile belongs to which organization, which Slack workspace is which. The prompt sends personal use to the Life projects (Reading, Messaging, Finances, HEALTH, Travel, Shopping) rather than to the default.
+
 ## Migrating from Clockify
 
 If you were running the old Clockify version, `migrate_clockify_to_kimai.py` mirrors your workspace into Kimai in one shot. Put **both** backends in `config.json` — the Kimai keys plus, temporarily, `clockify_api_key` and `clockify_workspace_id` — then:
