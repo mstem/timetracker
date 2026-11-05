@@ -1208,6 +1208,9 @@ def cmd_self_test() -> int:
     check("a key pinned to the default keeps its own activity",
           common.resolve_mapping("app:x", {"app:x": {"project": 53, "activity": 70}}, 53, 53),
           (53, 70))
+    check("  and so do the titles split from it",
+          common.resolve_mapping("app:x | some title", {"app:x": {"project": 53, "activity": 70}}, 53, 53),
+          (53, 70))
     check("phone entries are never split",
           keyed({"source": "android", "key": "android:todoist", "window": "android:todoist"}),
           "android:todoist")

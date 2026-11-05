@@ -440,12 +440,13 @@ def resolve_mapping(key: str, mappings: dict, default_project, default_activity)
     title that names nothing must not undo a mapping the base key already
     had."""
     own = mappings.get(key) or {}
+    base = mappings.get(key.split(TITLE_SEP, 1)[0]) or {}
     for k in (key, key.split(TITLE_SEP, 1)[0]):
         mapping = mappings.get(k) or {}
         if mapping.get("project") and mapping["project"] != default_project:
             return mapping["project"], mapping.get("activity") or default_activity
     # A key deliberately pinned to the default project keeps its own activity.
-    return default_project, own.get("activity") or default_activity
+    return default_project, own.get("activity") or base.get("activity") or default_activity
 
 
 def _split_lists(config: dict) -> tuple:
