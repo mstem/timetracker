@@ -15,6 +15,7 @@
   "google_oauth_client_secret": "<optional — matching OAuth client secret>",
   "owner_emails": ["you@example.com"],
   "extra_calendars": [],
+  "calendar_skip_titles": [],
   "meetings_project_id": null,
   "meetings_activity_id": null,
 

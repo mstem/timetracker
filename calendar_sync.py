@@ -30,6 +30,7 @@ import http.server
 import json
 import logging
 import os
+import re
 import socket
 import sys
 import urllib.error
@@ -182,6 +183,37 @@ def _self_declined(event: dict) -> bool:
     return False
 
 
+# Calendar events that block time for a task rather than meet anyone. They
+# never become Kimai timesheets, and the work logged during them stands.
+# config.json can add more under "calendar_skip_titles".
+DEFAULT_SKIP_TITLES = ["Weekly Theme/editorial draft"]
+
+
+def _title_words(title: str) -> list:
+    """Lowercase words in order, with a trailing "(...)" left off."""
+    return re.findall(r"[a-z0-9]+", re.sub(r"\s*\([^)]*\)\s*$", "", (title or "").lower()))
+
+
+def _skip_lists(config: dict) -> list:
+    extra = config.get("calendar_skip_titles") or []
+    if isinstance(extra, str):
+        extra = [extra]
+    return [w for w in (_title_words(t) for t in DEFAULT_SKIP_TITLES + list(extra)) if w]
+
+
+def skip_event(summary: str, config: dict, skips: list = None) -> bool:
+    """True when the event's title is a skip title: the same words in the same
+    order, whatever the case and punctuation, with a word allowed to carry a
+    plural "s" and a trailing "(...)" ignored. "weekly theme / editorial
+    drafts (CTFG)" matches; "Review weekly theme editorial draft with Joe"
+    does not."""
+    words = _title_words(summary)
+    for wanted in (skips if skips is not None else _skip_lists(config)):
+        if len(words) == len(wanted) and all(w == k or w == k + "s" for w, k in zip(words, wanted)):
+            return True
+    return False
+
+
 def qualifying_meetings(config: dict, date_str: str) -> list:
     """Return de-duplicated external meetings for the day, each as a dict with
     start/end (naive UTC datetimes), summary, uid, and external guest emails."""
@@ -198,6 +230,7 @@ def qualifying_meetings(config: dict, date_str: str) -> list:
     # token; a calendar an account can't see just 404s and is skipped. Dedup by
     # UID keeps a calendar visible to two accounts from being counted twice.
     extra_calendars = config.get("extra_calendars") or []
+    skips = _skip_lists(config)
     by_uid = {}
     for acct in tokens:
         try:
@@ -223,6 +256,9 @@ def qualifying_meetings(config: dict, date_str: str) -> list:
                 if "dateTime" not in start or "dateTime" not in end:
                     continue    # all-day / date-only event
                 if _self_declined(ev):
+                    continue
+                if skip_event(ev.get("summary", ""), config, skips):
+                    log.info(f"Skipping calendar event {ev.get('summary', '')!r} on {date_str}: a task block, not a meeting")
                     continue
                 guests = _external_guests(ev, owner_emails)
                 if not guests:
