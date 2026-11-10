@@ -12,7 +12,7 @@ Each such timesheet keeps its exact Kimai duration. The duration is divided
 across the timesheet's window titles in proportion to their seconds in that
 day's log, each title is resolved under the current rules, and the pieces are
 summed per target project. A timesheet whose pieces all land where it already
-is stays untouched. So Kimai's day totals cannot change, and no calendar
+is stays untouched. Kimai's day totals cannot change, and no calendar
 meeting is synced or re-clipped along the way.
 
   python3 refile_evens.py 2026-09-25 2026-11-08            # plan only, changes nothing in Kimai
@@ -113,19 +113,19 @@ def day_log(day: str):
 
 def group_entries(day_entries: list, key: str, day_keys: set) -> list:
     """The log entries a sent key was summed from. A title key holds the entries
-    with that title; a base key that was split that day (some other send that
-    day starts with "<key> | ") holds only its untitled leftovers."""
+    with that title; a base key holds the entries whose title key did not go
+    out on its own that day."""
     base = key.split(common.TITLE_SEP, 1)[0]
-    split_that_day = any(k.startswith(base + common.TITLE_SEP) for k in day_keys)
     out = []
     for e in day_entries:
         if common.entry_key(e) != base:
             continue
-        title = common.normalize_title(e.get("window", ""))
+        title_key = base + common.TITLE_SEP + common.normalize_title(e.get("window", ""))
         if common.TITLE_SEP in key:
-            if base + common.TITLE_SEP + title == key:
+            if title_key == key:
                 out.append(e)
-        elif not (split_that_day and title):
+        elif title_key not in day_keys:
+            # Whatever no title key of that day claimed went out under the base.
             out.append(e)
     return out
 
@@ -237,13 +237,15 @@ def show(moves: list):
         print(f"  {name:28} {h:.2f}h")
 
 
-def is_gone(config: dict, sheet_id: int) -> bool:
+def is_gone(config: dict, sheet_id: int):
+    """True when Kimai says 404, False when it returns the timesheet, None when
+    it gives no answer."""
     try:
         common.kimai_request(config, "GET", f"/timesheets/{sheet_id}")
     except urllib.error.HTTPError as e:
-        return e.code == 404
+        return True if e.code == 404 else None
     except Exception:
-        return False
+        return None
     return False
 
 
@@ -320,7 +322,17 @@ def apply(config: dict, moves: list, snapshot_dir: str = common.BASE_DIR):
         try:
             common.kimai_request(config, "DELETE", f"/timesheets/{m['sheet']['id']}")
         except Exception:
-            if is_gone(config, m["sheet"]["id"]):
+            gone = is_gone(config, m["sheet"]["id"])
+            if gone is None:
+                # Taking the pieces back could lose the time if the original is
+                # gone, and keeping them could count it twice. Keep them, record
+                # them, and stop for a person to look.
+                done |= {new["id"] for new in posted if new and new.get("id")}
+                save_posted(done, snapshot_dir)
+                print(f"  #{m['sheet']['id']} {m['day']}: Kimai did not answer; check whether #{m['sheet']['id']} "
+                      f"still exists next to its new pieces {sorted(new['id'] for new in posted if new)}; stopping")
+                raise
+            if gone:
                 # The delete went through and only the answer was lost.
                 done |= {new["id"] for new in posted if new and new.get("id")}
                 save_posted(done, snapshot_dir)
@@ -399,7 +411,7 @@ def self_test() -> int:
             calls.append((method, path))
             if method == "POST":
                 return {"id": 601}
-            if path == "/timesheets/7":
+            if method == "DELETE" and path == "/timesheets/7":
                 raise urllib.error.HTTPError(path, 500, "Server Error", {}, io.BytesIO())
         common.kimai_request = delete_fails
         try:
@@ -462,6 +474,27 @@ def self_test() -> int:
         common.kimai_request = real
     check("a post that timed out but saved is found and taken back out, never the original",
           [c for c in calls if c[0] == "DELETE"], [("DELETE", "/timesheets/801")])
+    t = lambda w: {"source": "terminal", "key": "~/projects/daily-briefing", "window": w}
+    sent_keys = {"~/projects/daily-briefing", "~/projects/daily-briefing | ctfg weekly summary doc"}
+    check("a folder with one CTFG title split out keeps its other titled entries",
+          [e["window"] for e in group_entries([t("✳ CTFG weekly summary doc"), t("✳ Evening brief")],
+                                              "~/projects/daily-briefing", sent_keys)], ["✳ Evening brief"])
+    calls.clear()
+    d = tempfile.mkdtemp()
+    def all_lost(config, method, path, body=None):
+        calls.append((method, path))
+        if method == "POST":
+            return {"id": 901}
+        raise TimeoutError("timed out")
+    common.kimai_request = all_lost
+    try:
+        apply({"timezone": "UTC"}, [move], snapshot_dir=d)
+    except Exception:
+        pass
+    finally:
+        common.kimai_request = real
+    check("when Kimai cannot say whether the original is gone, the new pieces stay",
+          [c for c in calls if c == ("DELETE", "/timesheets/901")], [])
     check("a day with no log file gives no entries", day_log("1999-01-01"), None)
     print(f"{len(fails) == 0 and 'all' or len(fails)} {'passed' if not fails else 'failed'}")
     return 1 if fails else 0
