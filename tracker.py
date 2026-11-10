@@ -385,8 +385,14 @@ def describe_group(key: str, group: dict) -> str:
     # Whole minutes, as the Sent log line counts them.
     total_minutes = int(group["seconds"] // 60)
     if not named:
-        label = key.split(common.TITLE_SEP, 1)[0].split(":", 1)[-1]
-        return f"{label} {_tag(total_minutes)}"
+        # A terminal key is the project folder, which names the work. An app,
+        # site or phone key ("app:slack", "chrome:docs.google.com") only names
+        # the tool, and a folder like "~" names nothing. A Terminal.app key can
+        # be a window title, so it goes through the same filter as titles.
+        base = key.split(common.TITLE_SEP, 1)[0]
+        tool = base.startswith(("app:", "chrome:", "android:", "[chrome]"))
+        label = "" if tool or common.is_noise_dirname(base) else common.clean_title(base)
+        return f"{label or 'other'} {_tag(total_minutes)}"
     titles = sorted(named, key=lambda t: -named[t])
     mins = _minutes([named[t] for t in titles] + [other], total_minutes)
     other_min = mins.pop()
@@ -1546,9 +1552,22 @@ def cmd_self_test() -> int:
           "Board notes (10m)")
     check("tags count whole minutes the way the log does", dg({"Board notes - Google Chrome - Matt": 1540}),
           "Board notes (25m)")
-    check("a group of only generic titles is named by its key",
+    check("a group of only generic titles in a site is other",
           describe_group("chrome:mail.google.com", {"seconds": 300, "titles": {"Gmail - Google Chrome - Matt": 300}}),
-          "mail.google.com (5m)")
+          "other (5m)")
+    check("  and in an app too",
+          describe_group("app:slack", {"seconds": 240, "titles": {"Slack": 240}}), "other (4m)")
+    check("  while a terminal folder keeps its name, which names the project",
+          describe_group("~/projects/timetracker", {"seconds": 600, "titles": {"zsh": 600}}),
+          "~/projects/timetracker (10m)")
+    for k, why in (("482913 is your sign-in code", "a folder key holding a code"),
+                   ("~", "the home folder"), ("-zsh", "a bare shell"),
+                   ("[chrome] inbox (3) - me@x.com - gmail", "a legacy Chrome key"),
+                   ("android:gmail", "a phone app")):
+        check(f"  but {why} is other", describe_group(k, {"seconds": 300, "titles": {"zsh": 300}}), "other (5m)")
+    check("  and a folder key with a colon keeps its name",
+          describe_group("matt@mac: ~/projects/ledger", {"seconds": 300, "titles": {"zsh": 300}}),
+          "matt@mac: ~/projects/ledger (5m)")
     check("a description never holds a line break",
           "\n" in dg({"Find in page\n    Budget 2027 - Google Chrome - Matt": 300}), False)
 
