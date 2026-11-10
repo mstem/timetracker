@@ -32,6 +32,7 @@ import urllib.error
 import shutil
 import signal
 import logging
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -344,12 +345,68 @@ def aggregate_entries(entries: list) -> dict:
     return dict(groups)
 
 
+DESCRIPTION_MAX = 500
+
+
+def _tag(minutes: int) -> str:
+    h, m = divmod(minutes, 60)
+    return f"({m}m)" if not h else f"({h}h)" if not m else f"({h}h{m}m)"
+
+
+def _minutes(seconds: list, total_minutes: int) -> list:
+    """Whole minutes per entry that add up to total_minutes: each gets its
+    floor, and the leftover minutes go to the largest remainders."""
+    total = sum(seconds)
+    if not total:
+        # Nothing to weigh by: the minutes go to the first entry.
+        return [total_minutes] + [0] * (len(seconds) - 1)
+    exact = [s * total_minutes / total for s in seconds]
+    out = [int(x) for x in exact]
+    for i in sorted(range(len(exact)), key=lambda i: out[i] - exact[i])[:total_minutes - sum(out)]:
+        out[i] += 1
+    return out
+
+
 def describe_group(key: str, group: dict) -> str:
-    """Pick the raw title with the greatest total duration in the group as the
-    Kimai description — resists title churn better than picking by count."""
-    if not group["titles"]:
-        return key
-    return max(group["titles"].items(), key=lambda kv: kv[1])[0]
+    """The Kimai description: every title that names the work, longest first,
+    each with its time, as "Title (25m); Other title (1h5m)". Time under titles
+    that name nothing (a new tab, an inbox, a sign-in page) is "other (7m)" at
+    the end, so the tags add up to the timesheet's length. Other models read
+    these descriptions to judge what the time was for, and daily-briefing
+    parses the format, splitting only at a "; " right after a tag."""
+    named = defaultdict(float)
+    other = 0.0
+    for title, secs in (group.get("titles") or {}).items():
+        clean = common.clean_title(title)
+        if clean:
+            named[clean] += secs
+        else:
+            other += secs
+    # Whole minutes, as the Sent log line counts them.
+    total_minutes = int(group["seconds"] // 60)
+    if not named:
+        label = key.split(common.TITLE_SEP, 1)[0].split(":", 1)[-1]
+        return f"{label} {_tag(total_minutes)}"
+    titles = sorted(named, key=lambda t: -named[t])
+    mins = _minutes([named[t] for t in titles] + [other], total_minutes)
+    other_min = mins.pop()
+    parts = []
+    for title, m in zip(titles, mins):
+        segment = f"{title} {_tag(m)}"
+        # Room for the segment and for an "other" at the end.
+        if m == 0 or len("; ".join(parts + [segment])) > DESCRIPTION_MAX - 20:
+            other_min += m
+            continue
+        parts.append(segment)
+    if not parts:
+        # No title earned a minute of its own: the longest one takes one from
+        # "other" when there is one, so the description still names the work.
+        first = 1 if other_min else 0
+        parts.append(f"{titles[0][:DESCRIPTION_MAX - 20]} {_tag(first)}")
+        other_min -= first
+    if other_min:
+        parts.append(f"other {_tag(other_min)}")
+    return "; ".join(parts)
 
 
 _parse_z = common.parse_z
@@ -1407,6 +1464,93 @@ def cmd_self_test() -> int:
               {"chrome:localhost:4310": {"project": 36, "activity": 36}})[0]),
               {"chrome:localhost:4310": {"project": 36, "activity": 36}}, 53, 53, hcfg, {**hpc, 36: 4}),
           (63, 76))
+
+    # Descriptions: every meaningful title, longest first, tags that add up
+    ct = common.clean_title
+    check("Chrome and profile wrapping come off a title",
+          ct("Synthloop launch timeline, November 2026 to May 2027 - Google Chrome - Matt (evensfoundation.eu)"),
+          "Synthloop launch timeline, November 2026 to May 2027")
+    check("  and so do the tab group, memory warning and window name",
+          ct("Campaign Builder - FGF 11-06-26 | Mailchimp - EVENS - Part of group \u2705Claude - High memory usage - 879 MB - Google Chrome - Matt (evensfoundation.eu)"),
+          "Campaign Builder - FGF 11-06-26 | Mailchimp")
+    check("a Meet title loses its prefix, its repeat and the camera notice",
+          ct("Meet \u2013 Weekly EF leads meeting - Meet \u2013 Weekly EF leads meeting - Camera and microphone recording - Google Chrome - Matt (evensfoundation.eu)"),
+          "Weekly EF leads meeting")
+    check("  also without Google Chrome in it",
+          ct("Meet \u2013 Dynamics Simulator launch plan draft with Jonathan - Matt (evensfoundation.eu)"),
+          "Dynamics Simulator launch plan draft with Jonathan")
+    check("a Gmail title keeps its subject only",
+          ct("Fwd: FW: Hackademie - youth literacy programme - matt.stempeck@evensfoundation.eu - Stichting Evens Mail - Google Chrome - Matt (evensfoundation.eu)"),
+          "Fwd: FW: Hackademie - youth literacy programme")
+    check("a Slack DM is short", ct("Daniel Mackisack (DM) - Superbloom, fka Simply Secure - 2 new items - Slack"),
+          "Slack DM: Daniel Mackisack")
+    check("  and so is a group DM with an unread mark",
+          ct("* joe.\u200belborn, Jonathan (DM) - Evens Foundation Board Space - Slack"), "Slack DM: joe.elborn, Jonathan")
+    check("a Slack channel is short", ct("general (Channel) - Evens Foundation - 1 new item - Slack"), "Slack: #general")
+    check("a Claude Code session title stays as it is", ct("\u2733 Weekly newsletter text with Daniel"),
+          "\u2733 Weekly newsletter text with Daniel")
+    check("  and its spinner states read as the same title", ct("\u25d1 Todoist #vibecode tasks"), "\u2733 Todoist #vibecode tasks")
+    for generic in ("New Tab", "EVENS", "Inbox (46) - matt.stempeck@evensfoundation.eu - Stichting Evens Mail - Google Chrome - Matt (evensfoundation.eu)",
+                    "Log in - Combell nv - Google Chrome - Matt (evensfoundation.eu)", "LinkedIn: Log In or Sign Up - Google Chrome - Matt (civictech.guide)",
+                    "Gmail - personal - Google Chrome - Matt", "Find in page\n    EVENS", "\u2733 Claude Code",
+                    "meet.google.com is sharing a window.", "personal - Google Chrome - Matt",
+                    "To save your password to Google Password Manager, the Password Manager icon in the Location Bar",
+                    "Search results - mstempeck@gmail.com - Gmail - personal - Google Chrome - Matt"):
+        check(f"  generic: {generic[:40]!r}", ct(generic), "")
+    check("a sign-in code never reaches a description",
+          ct("Your sign in code for Evens Foundation is 168622 - matt.stempeck@evensfoundation.eu - Stichting Evens Mail - Google Chrome - Matt (evensfoundation.eu)"), "")
+    for secret in ("Your verification code is 482913", "123456 is your Google verification code",
+                   "Use 482913 to sign in to Evens", "Your code for Evens Foundation: 4821",
+                   "Your PIN is 4821", "482913 is your security number", "Your code is 2024",
+                   "Code: 1999 - Google Chrome - Matt", "Password reset 48213 - Google Chrome - Matt",
+                   "Confirmation number 482913 for login",
+                   "Your OTP - Google Chrome - Matt", "Passcode for the board meeting",
+                   "2FA backup codes 48213 91822 - Google Chrome - Matt",
+                   "Reset link https://example.com/reset?token=abc123def - Google Chrome - Matt"):
+        check(f"  nor {secret[:30]!r}", ct(secret), "")
+    for work in ("\u2733 Fix sign in page", "Login flow redesign - Google Docs - Google Chrome - Matt",
+                 "Access code review for repo - Google Chrome - Matt", "\u2733 Code review for the 2026 budget"):
+        check(f"  while a work title is kept: {work[:30]!r}", ct(work) != "", True)
+    check("a semicolon without a space cannot split it either", ";" in ct("Retro (5m);actions - Google Chrome - Matt"), False)
+    check("an incognito title is never named", ct("Bank - Google Chrome - Matt (Incognito)"), "")
+    check("a semicolon inside a title cannot split the description",
+          ct("NLnet; Apply for a grant - Google Chrome - Matt"), "NLnet, Apply for a grant")
+
+    dg = lambda titles, secs=None: describe_group("chrome:x", {"seconds": secs or sum(titles.values()), "titles": titles})
+    check("every title goes in, longest first",
+          dg({"Joe (DM) - Evens Foundation - Slack": 720,
+              "Synthloop launch timeline - Google Chrome - Matt (evensfoundation.eu)": 1500}),
+          "Synthloop launch timeline (25m); Slack DM: Joe (12m)")
+    check("the same title from two windows counts once",
+          dg({"Campaign Builder - FGF | Mailchimp - EVENS - Google Chrome - Matt (evensfoundation.eu)": 300,
+              "Campaign Builder - FGF | Mailchimp - personal - Google Chrome - Matt": 300}),
+          "Campaign Builder - FGF | Mailchimp (10m)")
+    check("dropped titles' time goes to a final other",
+          dg({"Board notes - Google Chrome - Matt (evensfoundation.eu)": 1200, "New Tab": 420}),
+          "Board notes (20m); other (7m)")
+    check("hours read as 1h5m", dg({"\u2733 Synthloop board notes": 3900}), "\u2733 Synthloop board notes (1h5m)")
+    check("  and a whole hour as 1h", dg({"\u2733 Synthloop board notes": 3600}), "\u2733 Synthloop board notes (1h)")
+    def tag_minutes(d):
+        return sum(int(h or 0) * 60 + int(m or 0) for h, m in re.findall(r"\((?:(\d+)h)?(?:(\d+)m)?\)(?:; |$)", d))
+    mixed = {f"Doc number {i} - Google Chrome - Matt": 100 + 37 * i for i in range(9)}
+    check("the tags add up to the timesheet's minutes", tag_minutes(dg(mixed)), sum(mixed.values()) // 60)
+    many = {f"A long document title that keeps going for a while, number {i} - Google Chrome - Matt": 600 - i for i in range(30)}
+    long_d = dg(many)
+    check("a long list stops short of 500 characters", len(long_d) <= 500, True)
+    check("  and its tags still add up", tag_minutes(long_d), sum(many.values()) // 60)
+    check("  and it ends with other", long_d.rsplit("; ", 1)[1].startswith("other ("), True)
+    check("a named title too small for a minute of its own still gets one when there is one",
+          dg({"Board notes - Google Chrome - Matt": 20, "New Tab": 580}), "Board notes (1m); other (9m)")
+    check("titles with no seconds still leave tags that add up",
+          describe_group("chrome:x", {"seconds": 600, "titles": {"Board notes - Google Chrome - Matt": 0}}),
+          "Board notes (10m)")
+    check("tags count whole minutes the way the log does", dg({"Board notes - Google Chrome - Matt": 1540}),
+          "Board notes (25m)")
+    check("a group of only generic titles is named by its key",
+          describe_group("chrome:mail.google.com", {"seconds": 300, "titles": {"Gmail - Google Chrome - Matt": 300}}),
+          "mail.google.com (5m)")
+    check("a description never holds a line break",
+          "\n" in dg({"Find in page\n    Budget 2027 - Google Chrome - Matt": 300}), False)
 
     SENT_FILE = real_sent_file
     logging.disable(logging.NOTSET)

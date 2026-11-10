@@ -468,6 +468,92 @@ def normalize_title(title: str) -> str:
     return normalize_key(t)
 
 
+# Titles as they go into a Kimai description: readable, in their own case, with
+# the window furniture off and nothing secret left in.
+_CHROME_TAIL = re.compile(r"(\s+-\s+Google Chrome)?(\s+-\s+Matt(\s+\([^)]*\))?)?\s*$")
+_GROUP = re.compile(r"\s+-\s+Part of group [^-]*?(?=\s+-\s|$)", re.I)
+_WINDOW_NAMES = re.compile(r"(\s+-\s+(EVENS|personal))+\s*$")
+_MAIL_TAIL = re.compile(r"\s+-\s+[\w.+-]+@[\w.-]+(\s+-\s+.*)?$")
+_SLACK = re.compile(r"^(?:\*\s*)?(.+?)\s+\((DM|Channel)\)\s+-\s+.*-\s+Slack$|^(?:\*\s*)?(.+?)\s+-\s+.*-\s+Slack$")
+# Anything that may carry a code someone sent to sign in. This fails closed: a
+# one-time-password word drops the title outright, and so does a 4-8 digit
+# number (years aside) within a few words of "code", "PIN", "password",
+# "token", "security", "sign in", "log in", "confirm" or "verify", in either
+# order, and any number said outright as one ("code: 2024", "is your"). A
+# work title that only mentions codes and has no such number ("Access code
+# review") stays.
+_CODE_NUMBER = r"\b(?!(?:19|20)\d\d\b)\d{4,8}\b"
+_CODE_WORD = (r"\b(?:codes?|pins?|tokens?|passwords?|security|auth\w*|confirm\w*"
+              r"|sign[- ]?in|log[- ]?in|verif\w*)\b")
+_SECRET = re.compile(r"\b(otp|passcode|2fa|mfa|one[- ]time password)\b"
+                     # Said outright, a year-shaped number is a code too.
+                     r"|\b(code|pin|otp|passcode|password|token)\s*(is|:)\s*\d{4,8}\b"
+                     r"|\b\d{4,8}\s+is\s+your\b"
+                     rf"|{_CODE_WORD}\W+(?:\w+\W+){{0,6}}?{_CODE_NUMBER}"
+                     rf"|{_CODE_NUMBER}\W+(?:\w+\W+){{0,6}}?{_CODE_WORD}"
+                     r"|[?&](token|code|key|auth|sig|signature|password|secret)=", re.I)
+_URL = re.compile(r"https?://\S+")
+# Titles that name no work. A sign-in page is "Log in - Combell nv", "Sign in to
+# GitHub" or "LinkedIn: Log In or Sign Up"; "Fix sign in page" is work.
+_GENERIC_DISPLAY = re.compile(
+    r"^(new tab|evens|personal|inbox|gmail|google|search results|untitled|claude code|loading.*"
+    r"|find in page.*|\S+ is sharing (a window|your screen)\.?|to save your password.*"
+    r"|(log ?in|sign ?in|sign up|login)(\s+(-|to|\||\u2013)\s+.*)?"
+    r"|.*:\s*(log ?in|sign ?in)(\s+or\s+sign ?up)?)$", re.I)
+_SPINNER = re.compile(r"^[\u2733\u25d0-\u25d3\u2800-\u28ff]+\s*")
+TITLE_DISPLAY_MAX = 120
+
+
+def clean_title(title: str) -> str:
+    """A window title the way a person would name the work, or "" when nothing
+    in it does. Used for Kimai descriptions, which other models read to judge
+    the time, so it keeps the title's own case and never carries a sign-in
+    code, a one-time password or a URL."""
+    raw = (title or "").replace("\u200b", "")
+    if "(incognito)" in raw.lower() or _SECRET.search(raw):
+        return ""
+    t = re.sub(r"\s+", " ", raw).strip()
+    if t.lower().startswith("find in page"):
+        return ""
+    session = bool(_SPINNER.match(t))
+    t = _SPINNER.sub("", t)
+    t = _TITLE_UNREAD.sub("", t)
+    t = _TITLE_SIZE.sub("", t)
+    t = _URL.sub("", t)
+    slack = _SLACK.match(t) if t.endswith(" - Slack") else None
+    if slack:
+        if slack.group(2) == "DM":
+            t = "Slack DM: " + slack.group(1)
+        elif slack.group(2) == "Channel":
+            t = "Slack: #" + slack.group(1)
+        else:
+            t = "Slack: " + slack.group(3)
+    else:
+        for pattern in _TITLE_VOLATILE:
+            t = pattern.sub("", t)
+        t = _GROUP.sub("", t)
+        t = _CHROME_TAIL.sub("", t)
+        t = _WINDOW_NAMES.sub("", t)
+        if _MAIL_TAIL.search(t):
+            # Gmail: "<subject or folder> (12) - <address> - <mailbox>".
+            t = re.sub(r"\s\(\d[\d,]*\)$", "", _MAIL_TAIL.sub("", t))
+        if t.startswith("Meet \u2013 "):
+            t = t[len("Meet \u2013 "):]
+            # Meet repeats its own name in the title: "X - Meet – X".
+            t = t.split(" - Meet \u2013 ", 1)[0]
+    t = re.sub(r"\s+", " ", t).strip(" -")
+    # daily-briefing splits a description at a ";" after a tag, so none may be
+    # left inside a title.
+    t = re.sub(r"\s*;\s*", ", ", t)
+    if not t or len(t) <= 2 or _GENERIC_DISPLAY.match(t) or t.lower() in _GENERIC_TITLES:
+        return ""
+    if len(t) > TITLE_DISPLAY_MAX:
+        t = t[:TITLE_DISPLAY_MAX - 1].rstrip() + "\u2026"
+    # Claude Code session titles keep their mark, and every spinner state of
+    # one session reads as the same title.
+    return "\u2733 " + t if session else t
+
+
 def profile_mapping(key: str, config: dict) -> dict:
     """The mapping for the Chrome profile named at the end of a title key, from
     `profile_projects` in config.json, or {}. A Chrome title ends with its
