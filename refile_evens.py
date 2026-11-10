@@ -120,6 +120,8 @@ def plan(config: dict, first: str, last: str, keys: list, evens_project: int) ->
     projects = common.list_kimai_projects(config)
     project_customer = {p["id"]: p.get("customer") for p in projects}
     names = {p["id"]: p["name"] for p in projects}
+    if evens_project not in project_customer:
+        sys.exit(f"Project {evens_project} is not a visible Kimai project; pass --evens-project with an active Evens project id")
     evens = project_customer[evens_project]
     keys = {common.normalize_key(k) for k in keys}
 
@@ -221,6 +223,16 @@ def show(moves: list):
         print(f"  {name:28} {h:.2f}h")
 
 
+def is_gone(config: dict, sheet_id: int) -> bool:
+    try:
+        common.kimai_request(config, "GET", f"/timesheets/{sheet_id}")
+    except urllib.error.HTTPError as e:
+        return e.code == 404
+    except Exception:
+        return False
+    return False
+
+
 def take_back(config: dict, posted: list):
     for new in posted:
         if new and new.get("id"):
@@ -233,6 +245,9 @@ def split_seconds(duration: int, weights: list) -> list:
     total = sum(weights) or 1
     out = [round(duration * w / total) for w in weights]
     if out:
+        # A sliver under the tracker's own minimum would never have been sent
+        # on its own, so it joins the largest piece and gets no timesheet.
+        out = [0 if x < tracker.MIN_ENTRY_SECONDS else x for x in out]
         out[max(range(len(out)), key=lambda i: weights[i])] += duration - sum(out)
     return out
 
@@ -251,6 +266,8 @@ def apply(config: dict, moves: list, snapshot_dir: str = common.BASE_DIR):
         posted = []
         tags = ",".join(t if isinstance(t, str) else t.get("name", "") for t in m["sheet"].get("tags") or [])
         for p in m["pieces"]:
+            if p["seconds"] <= 0:
+                continue
             start = common.parse_z(p["start"])
             body = {
                 "begin": common.kimai_local_time(start, config),
@@ -272,13 +289,19 @@ def apply(config: dict, moves: list, snapshot_dir: str = common.BASE_DIR):
         try:
             common.kimai_request(config, "DELETE", f"/timesheets/{m['sheet']['id']}")
         except Exception:
+            if is_gone(config, m["sheet"]["id"]):
+                # The delete went through and only the answer was lost.
+                done |= {new["id"] for new in posted if new and new.get("id")}
+                save_posted(done, snapshot_dir)
+                print(f"  #{m['sheet']['id']} {m['day']} re-filed into {len(posted)} timesheet(s)")
+                continue
             # The original is still there, so its pieces would count the time twice.
             take_back(config, posted)
             print(f"  #{m['sheet']['id']} {m['day']}: could not delete the original, its pieces taken back; stopping")
             raise
         done |= {new["id"] for new in posted if new and new.get("id")}
         save_posted(done, snapshot_dir)
-        print(f"  #{m['sheet']['id']} {m['day']} re-filed into {len(m['pieces'])} timesheet(s)")
+        print(f"  #{m['sheet']['id']} {m['day']} re-filed into {len(posted)} timesheet(s)")
 
 
 def self_test() -> int:
@@ -359,6 +382,30 @@ def self_test() -> int:
         common.kimai_request = real
     check("pieces add up to the original duration to the second",
           sum(split_seconds(1802, [1, 1, 1, 1])), 1802)
+    check("a piece under the tracker's minimum folds into the largest one",
+          split_seconds(1800, [1799, 1]), [1800, 0])
+    calls.clear()
+    d = tempfile.mkdtemp()
+    def delete_times_out(config, method, path, body=None):
+        calls.append((method, path))
+        if method == "POST":
+            return {"id": 701}
+        if method == "DELETE" and path == "/timesheets/7":
+            raise TimeoutError("timed out")
+        if method == "GET" and path == "/timesheets/7":
+            raise urllib.error.HTTPError(path, 404, "Not Found", {}, io.BytesIO())
+    common.kimai_request = delete_times_out
+    move0 = {"day": "2026-01-01", "sheet": {"id": 7, "tags": []}, "pieces": [
+        {"project": 63, "activity": 76, "seconds": 600, "start": "2026-01-01T10:00:00Z", "description": "a"},
+        {"project": 23, "activity": 22, "seconds": 0, "start": "2026-01-01T10:00:00Z", "description": "b"}]}
+    try:
+        apply({"timezone": "UTC"}, [move0], snapshot_dir=d)
+    finally:
+        common.kimai_request = real
+    check("a delete that timed out but went through keeps the new pieces",
+          load_posted(d), {701})
+    check("a zero-second piece is not posted",
+          len([c for c in calls if c[0] == "POST"]), 1)
     check("a day with no log file gives no entries", day_log("1999-01-01"), None)
     print(f"{len(fails) == 0 and 'all' or len(fails)} {'passed' if not fails else 'failed'}")
     return 1 if fails else 0
