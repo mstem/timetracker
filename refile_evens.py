@@ -36,17 +36,33 @@ import ai_matcher
 import common
 import tracker
 
-SENT = re.compile(r"Sent \[(\d{4}-\d\d-\d\d)\] '(.*)' \((.*)\) → (\d+)m$")
+SENT = re.compile(r"Sent \[(\d{4}-\d\d-\d\d)\] '(.*)' \((.*)\) → (\d+)m$", re.S)
 DEFAULT_KEYS = ["~/projects/hub", "~/projects/daily-briefing"]
 
 
-def sends(first: str, last: str) -> list:
+def sends(first: str, last: str, path: str = None) -> list:
+    """(day, description, key, minutes) per Sent line. A window title with a
+    line break in it carries over onto the following log lines, so an
+    unfinished Sent line takes up to three more."""
     out = []
-    with open(tracker.LOG_FILE, errors="replace") as f:
-        for line in f:
-            m = SENT.search(line.rstrip("\n"))
-            if m and first <= m.group(1) <= last:
-                out.append((m.group(1), m.group(2), m.group(3), int(m.group(4))))
+    with open(path or tracker.LOG_FILE, errors="replace") as f:
+        lines = f.read().split("\n")
+    i = 0
+    while i < len(lines):
+        text = lines[i]
+        m = SENT.search(text)
+        if not m and "INFO Sent [" in text:
+            for extra in range(1, 4):
+                if i + extra >= len(lines):
+                    break
+                text += "\n" + lines[i + extra]
+                m = SENT.search(text)
+                if m:
+                    i += extra
+                    break
+        if m and first <= m.group(1) <= last:
+            out.append((m.group(1), m.group(2), m.group(3), int(m.group(4))))
+        i += 1
     return out
 
 
@@ -516,6 +532,15 @@ def self_test() -> int:
         common.kimai_request = real
     check("a piece that cannot be taken back is recorded so later runs leave it alone",
           load_posted(d), {951})
+    log = os.path.join(tempfile.mkdtemp(), "tracker.log")
+    with open(log, "w") as f:
+        f.write("2026-11-07 00:00:16,083 INFO Sent [2026-11-06] 'Find in page\n"
+                "    EVENS' (chrome:us19.admin.mailchimp.com) \u2192 15m\n"
+                "2026-11-07 00:00:17,000 INFO Sent [2026-11-06] 'Inbox' (chrome:mail.google.com) \u2192 3m\n")
+    check("a Sent line whose description spans two lines is read whole",
+          sends("2026-11-06", "2026-11-06", log),
+          [("2026-11-06", "Find in page\n    EVENS", "chrome:us19.admin.mailchimp.com", 15),
+           ("2026-11-06", "Inbox", "chrome:mail.google.com", 3)])
     check("a day with no log file gives no entries", day_log("1999-01-01"), None)
     print(f"{len(fails) == 0 and 'all' or len(fails)} {'passed' if not fails else 'failed'}")
     return 1 if fails else 0
