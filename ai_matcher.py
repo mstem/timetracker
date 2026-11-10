@@ -288,6 +288,15 @@ def classify_keys_with_claude(api_key: str, unmapped: dict, projects: list, mapp
 # Activity resolution  (Kimai timesheets need a project AND an activity)
 # ---------------------------------------------------------------------------
 
+def apply_title_rule(matches: dict, config: dict, projects: list) -> dict:
+    """Overrule the model where a title names CTFG work: the matcher saves a
+    CTFG project for such a key, never an Evens one or a null that would fall
+    back to its folder's mapping. See common.enforce_title_rule."""
+    project_customer = {p["id"]: p.get("customer") for p in projects}
+    return {k: common.enforce_title_rule(k, v, config, project_customer)
+            for k, v in matches.items()}
+
+
 def build_activity_resolver(config: dict, activities: list):
     """Return resolve(project_id) -> activity_id. Prefers an activity scoped to
     that project (one named 'General' if present), then the configured
@@ -343,6 +352,7 @@ def classify_and_save(config: dict, entries: list) -> dict:
         resolve_activity = build_activity_resolver(config, common.list_kimai_activities(config))
         matches = classify_keys_with_claude(anthropic_key, unmapped, projects, mappings,
                                             config.get("classifier_hints"))
+        matches = apply_title_rule(matches, config, projects)
         to_save = {}
         for key, pid in matches.items():
             if not pid:
@@ -352,7 +362,7 @@ def classify_and_save(config: dict, entries: list) -> dict:
                 if common.TITLE_SEP in key:
                     to_save[key] = {"project": None, "activity": None}
                 continue
-            activity_id = resolve_activity(pid)
+            activity_id = common.rule_activity(key, pid, config) or resolve_activity(pid)
             if not activity_id:
                 log.warning(f"'{key}' → project {pid} but no activity resolvable — leaving unmapped")
                 continue
@@ -503,6 +513,7 @@ def cmd_match(days: int, dry_run: bool, interactive: bool):
     except RuntimeError as e:
         print(f"ERROR: {e}")
         sys.exit(1)
+    matches = apply_title_rule(matches, config, projects)
 
     project_by_id = {p["id"]: p for p in projects}
     keys = list(unmapped.keys())
@@ -539,7 +550,7 @@ def cmd_match(days: int, dry_run: bool, interactive: bool):
                 continue
 
             if result:
-                activity_id = resolve_activity(result["id"])
+                activity_id = common.rule_activity(key, result["id"], config) or resolve_activity(result["id"])
                 if activity_id:
                     to_save[key] = {"project": result["id"], "activity": activity_id}
                     log.info(f"Matched '{key}' → {result['name']} (interactive)")
@@ -556,7 +567,7 @@ def cmd_match(days: int, dry_run: bool, interactive: bool):
         for key in keys:
             project_id = matches.get(key)
             if project_id and project_id in project_by_id:
-                activity_id = resolve_activity(project_id)
+                activity_id = common.rule_activity(key, project_id, config) or resolve_activity(project_id)
                 if activity_id:
                     to_save[key] = {"project": project_id, "activity": activity_id}
                     print(f"  {key}  →  {project_by_id[project_id]['name']}")

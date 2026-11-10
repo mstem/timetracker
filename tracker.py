@@ -456,7 +456,7 @@ def send_to_kimai(config: dict, date_str: str, entries: list, sources=None) -> d
         # timesheets either, and a send that fails is retried, where one that
         # quietly filed Granola under the default would be recorded as done.
         project_customer = ({p["id"]: p.get("customer") for p in common.list_kimai_projects(config)}
-                            if config.get("context_keys") or config.get("profile_projects") else {})
+                            if common.needs_project_customer(config) else {})
 
         def resolve_mac(key: str):
             return common.resolve_mapping(key, mappings, default_project, default_activity,
@@ -1285,6 +1285,103 @@ def cmd_self_test() -> int:
     check("phone entries are never split",
           keyed({"source": "android", "key": "android:todoist", "window": "android:todoist"}),
           "android:todoist")
+
+    # Multi-project folders and the CTFG rule. Customer 2 is CTFG, 4 is Evens.
+    hcfg = {"default_project_id": 53,
+            "title_split_keys": ["~/projects/hub"],
+            "ctfg_title_rule": {"project": 63, "activity": 76},
+            "profile_projects": [{"suffix": "google chrome - civictech.guide", "project": 63, "activity": 76}]}
+    hmaps = {"~/projects/hub": {"project": 23, "activity": 22},
+             "~/projects/daily-briefing": {"project": 23, "activity": 22}}
+    hpc = {63: 2, 38: 2, 23: 4, 20: 4, 2: 1}
+    def hub_files(window, maps=hmaps, key="~/projects/hub"):
+        e = common.split_by_title([{"source": "terminal", "key": key, "window": window}], hcfg, maps)[0]
+        return common.resolve_mapping(common.entry_key(e), maps, 53, 53, hcfg, hpc)
+    check("a hub session titled with Daniel files to CTFG",
+          hub_files("✳ Weekly newsletter text with Daniel"), (63, 76))
+    check("an Evens-titled hub session still files to Evens",
+          hub_files("✳ Evens weekly summary Google Doc"), (23, 22))
+    nk = "~/projects/hub | weekly newsletter text with daniel"
+    check("  a more specific CTFG project the model chose is kept",
+          hub_files("✳ Weekly newsletter text with Daniel", {**hmaps, nk: {"project": 38, "activity": 38}}),
+          (38, 38))
+    check("  an Evens project the model chose is overruled",
+          hub_files("✳ Weekly newsletter text with Daniel", {**hmaps, nk: {"project": 20, "activity": 19}}),
+          (63, 76))
+    check("  and so is a personal one",
+          hub_files("✳ Weekly newsletter text with Daniel", {**hmaps, nk: {"project": 2, "activity": 2}}),
+          (63, 76))
+    check("a CTFG title in a folder that is not split is pulled out of it",
+          hub_files("✳ CTFG weekly summary doc", key="~/projects/daily-briefing"), (63, 76))
+    check("  while the folder's other titles stay whole",
+          common.entry_key(common.split_by_title(
+              [{"source": "terminal", "key": "~/projects/daily-briefing", "window": "✳ Evening brief"}],
+              hcfg, hmaps)[0]), "~/projects/daily-briefing")
+    for word in ("Superbloom Slack", "Simply Secure invoice", "Civic Tech Field Guide taxonomies",
+                 "Field Guide newsletter"):
+        check(f"  '{word}' counts as CTFG", hub_files("✳ " + word), (63, 76))
+    check("an Evens Chrome profile window naming CTFG files to CTFG",
+          common.resolve_mapping("chrome:internal | ctfg workboard - google chrome - matt (evensfoundation.eu)",
+                                 {}, 53, 53, {**hcfg, "profile_projects": [
+                                     {"suffix": "(evensfoundation.eu)", "project": 23, "activity": 22}]}, hpc),
+          (63, 76))
+    check("a word that only contains a CTFG name is not CTFG",
+          hub_files("✳ Danielle's lease renewal"), (23, 22))
+    check("the matcher never saves an Evens project for a CTFG title",
+          common.enforce_title_rule(nk, 23, hcfg, hpc), 63)
+    check("  nor a null",
+          common.enforce_title_rule(nk, None, hcfg, hpc), 63)
+    check("  but keeps a CTFG one",
+          common.enforce_title_rule(nk, 38, hcfg, hpc), 38)
+    import ai_matcher
+    check("the matcher's answers pass through the rule",
+          ai_matcher.apply_title_rule({nk: 23, "~/projects/hub | evening brief": None}, hcfg,
+                                      [{"id": 63, "customer": 2}, {"id": 23, "customer": 4}]),
+          {nk: 63, "~/projects/hub | evening brief": None})
+    check("  and leaves other titles alone",
+          common.enforce_title_rule("~/projects/hub | evening brief", 23, hcfg, hpc), 23)
+    check("the send path loads customers when only the CTFG rule needs them",
+          common.needs_project_customer({"ctfg_title_rule": {"project": 63, "activity": 76}}), True)
+    check("  and not when no rule does",
+          common.needs_project_customer({"default_project_id": 53}), False)
+    check("an overruled answer is saved with the rule's activity",
+          common.rule_activity(nk, 63, hcfg), 76)
+    check("  but a CTFG project the model chose keeps its own",
+          common.rule_activity(nk, 38, hcfg), None)
+    check("a saved CTFG project with no activity does not borrow the rule's activity",
+          hub_files("✳ Weekly newsletter text with Daniel", {**hmaps, nk: {"project": 38}}), (38, 53))
+    cm = {"~/projects/ctfg-curator": {"project": 38, "activity": 37}}
+    check("a folder mapped to a specific CTFG project keeps its CTFG-titled windows",
+          hub_files("✳ CTFG curator taxonomy", cm, key="~/projects/ctfg-curator"), (38, 37))
+    check("  even after the matcher saved the generic CTFG project for the title",
+          hub_files("✳ CTFG curator taxonomy",
+                    {**cm, "~/projects/ctfg-curator | ctfg curator taxonomy": {"project": 63, "activity": 76}},
+                    key="~/projects/ctfg-curator"), (38, 37))
+    check("  while a title the model put on a specific CTFG project keeps that",
+          hub_files("✳ CTFG curator taxonomy",
+                    {"~/projects/ctfg-curator": {"project": 63, "activity": 76},
+                     "~/projects/ctfg-curator | ctfg curator taxonomy": {"project": 38, "activity": 37}},
+                    key="~/projects/ctfg-curator"), (38, 37))
+    check("two projects with no known customer are not the same customer",
+          common.enforce_title_rule(nk, 99, hcfg, {23: 4}), 63)
+    g_ctfg = {"source": "app", "key": "app:granola", "window": "Daniel / Matt weekly",
+              "start": "1999-01-01T13:00:00Z", "end": "1999-01-01T13:30:00Z", "seconds": 1800}
+    g_cfg = {**gcfg, **hcfg}
+    g_split = common.split_by_title([g_ctfg, far], g_cfg, {})
+    g_out, g_extra = common.assign_context(g_split, g_cfg, res_, pc)
+    check("a Granola title naming CTFG skips the nearest-work guess and takes the rule",
+          common.resolve_mapping(common.entry_key(g_out[0]), g_extra, 53, 53, g_cfg, hpc), (63, 76))
+    check("a CTFG profile window without the parentheses files to CTFG",
+          common.resolve_mapping("chrome:internal | board notes - google chrome - civictech.guide",
+                                 {"chrome:internal": {"project": 53, "activity": 53}}, 53, 53, hcfg, hpc),
+          (63, 76))
+    check("a CTFG-titled window on a domain mapped to Evens files to CTFG",
+          common.resolve_mapping(common.entry_key(common.split_by_title(
+              [{"source": "chrome", "key": "chrome:localhost:4310",
+                "window": "CTFG - Google Chrome - civictech.guide"}], hcfg,
+              {"chrome:localhost:4310": {"project": 36, "activity": 36}})[0]),
+              {"chrome:localhost:4310": {"project": 36, "activity": 36}}, 53, 53, hcfg, {**hpc, 36: 4}),
+          (63, 76))
 
     SENT_FILE = real_sent_file
     logging.disable(logging.NOTSET)
