@@ -409,6 +409,13 @@ def fuzzy_find_project(name_query: str, projects: list):
 # Interactive confirmation
 # ---------------------------------------------------------------------------
 
+def hand_set(result: dict, proposal) -> bool:
+    """In the interactive matcher, only a project Matt typed counts as set by
+    hand. Accepting the model's proposal keeps it a model answer, so the CTFG
+    rule and the more specific folder or profile mappings still apply."""
+    return result is not proposal
+
+
 def confirm_match(key: str, project: dict, projects: list, config: dict):
     """
     Ask the user to confirm, reject, or override a proposed match.
@@ -552,7 +559,9 @@ def cmd_match(days: int, dry_run: bool, interactive: bool):
             if result:
                 activity_id = common.rule_activity(key, result["id"], config) or resolve_activity(result["id"])
                 if activity_id:
-                    to_save[key] = {"project": result["id"], "activity": activity_id, "manual": True}
+                    to_save[key] = {"project": result["id"], "activity": activity_id}
+                    if hand_set(result, project_by_id.get(project_id)):
+                        to_save[key]["manual"] = True
                     log.info(f"Matched '{key}' → {result['name']} (interactive)")
                 else:
                     to_save.pop(key, None)

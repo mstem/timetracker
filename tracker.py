@@ -1377,6 +1377,11 @@ def cmd_self_test() -> int:
     check("a hand-set mapping to the default project is kept",
           hub_files("✳ Weekly newsletter text with Daniel",
                     {**hmaps, nk: {"project": 53, "activity": 53, "manual": True}}), (53, 53))
+    prop = {"id": 63, "name": "CTFG general bucket"}
+    check("accepting the model's proposal in the interactive matcher is not a hand-set mapping",
+          ai_matcher.hand_set(prop, prop), False)
+    check("  typing another project is", ai_matcher.hand_set({"id": 38, "name": "Newsletter"}, prop), True)
+    check("  and so is typing one where the model had none", ai_matcher.hand_set({"id": 38}, None), True)
     check("the hand-set mark survives loading and saving the mappings file",
           common.normalize_mapping_value({"project": 23, "activity": 22, "manual": True}),
           {"project": 23, "activity": 22, "manual": True})

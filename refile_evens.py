@@ -44,7 +44,7 @@ DEFAULT_KEYS = ["~/projects/hub", "~/projects/daily-briefing"]
 def sends(first: str, last: str, path: str = None) -> list:
     """(day, description, key, minutes) per Sent line. A window title with a
     line break in it carries over onto the following log lines, so an
-    unfinished Sent line takes up to three more."""
+    unfinished Sent line runs on to the next timestamped log record."""
     out = []
     with open(path or tracker.LOG_FILE, errors="replace") as f:
         lines = f.read().split("\n")
@@ -53,7 +53,9 @@ def sends(first: str, last: str, path: str = None) -> list:
         text = lines[i]
         m = SENT.search(text)
         if not m and "INFO Sent [" in text:
-            for extra in range(1, 4):
+            extra = 0
+            while True:
+                extra += 1
                 # A line with its own timestamp is the next log record, so the
                 # unfinished one ended there.
                 if i + extra >= len(lines) or LOG_RECORD.match(lines[i + extra]):
@@ -63,7 +65,8 @@ def sends(first: str, last: str, path: str = None) -> list:
                 if m:
                     i += extra
                     break
-            if not m:
+            day = re.search(r"Sent \[(\d{4}-\d\d-\d\d)\]", text)
+            if not m and day and first <= day.group(1) <= last:
                 print(f"  ! unreadable Sent line, skipped: {lines[i][:100]}")
         if m and first <= m.group(1) <= last:
             out.append((m.group(1), m.group(2), m.group(3), int(m.group(4))))
@@ -545,6 +548,10 @@ def self_test() -> int:
     with open(log, "a") as f:
         f.write("2026-11-07 00:00:18,000 INFO Sent [2026-11-07] 'Cut off\n"
                 "2026-11-07 00:00:19,000 INFO Sent [2026-11-07] 'Gmail' (chrome:mail.google.com) \u2192 2m\n")
+    with open(log, "a") as f:
+        f.write("2026-11-08 00:00:20,000 INFO Sent [2026-11-08] 'One\nTwo\nThree\nFour\nFive' (chrome:x) \u2192 4m\n")
+    check("a title with many line breaks is still read",
+          sends("2026-11-08", "2026-11-08", log), [("2026-11-08", "One\nTwo\nThree\nFour\nFive", "chrome:x", 4)])
     check("a cut-off Sent line never swallows the next one",
           sends("2026-11-07", "2026-11-07", log), [("2026-11-07", "Gmail", "chrome:mail.google.com", 2)])
     check("a Sent line whose description spans two lines is read whole",
