@@ -28,9 +28,9 @@ Already-synced meetings are tracked in synced_meetings.json so re-sends don't du
 import datetime
 import http.server
 import json
-import re
 import logging
 import os
+import re
 import socket
 import sys
 import urllib.error
@@ -189,19 +189,27 @@ def _self_declined(event: dict) -> bool:
 DEFAULT_SKIP_TITLES = ["Weekly Theme/editorial draft"]
 
 
-def _title_words(title: str) -> set:
-    # Lowercase words with a plural "s" off, so "drafts" matches "draft".
-    return {w[:-1] if len(w) > 3 and w.endswith("s") else w
-            for w in re.findall(r"[a-z0-9]+", (title or "").lower())}
+def _title_words(title: str) -> list:
+    """Lowercase words in order, with a trailing "(...)" left off."""
+    return re.findall(r"[a-z0-9]+", re.sub(r"\s*\([^)]*\)\s*$", "", (title or "").lower()))
 
 
-def skip_event(summary: str, config: dict) -> bool:
-    """True when every word of a skip title is in the event's title, so small
-    variants ("weekly theme / editorial draft", "... (CTFG)") match too."""
+def _skip_lists(config: dict) -> list:
+    extra = config.get("calendar_skip_titles") or []
+    if isinstance(extra, str):
+        extra = [extra]
+    return [w for w in (_title_words(t) for t in DEFAULT_SKIP_TITLES + list(extra)) if w]
+
+
+def skip_event(summary: str, config: dict, skips: list = None) -> bool:
+    """True when the event's title is a skip title: the same words in the same
+    order, whatever the case and punctuation, with a word allowed to carry a
+    plural "s" and a trailing "(...)" ignored. "weekly theme / editorial
+    drafts (CTFG)" matches; "Review weekly theme editorial draft with Joe"
+    does not."""
     words = _title_words(summary)
-    for title in DEFAULT_SKIP_TITLES + list(config.get("calendar_skip_titles") or []):
-        wanted = _title_words(title)
-        if wanted and wanted <= words:
+    for wanted in (skips if skips is not None else _skip_lists(config)):
+        if len(words) == len(wanted) and all(w == k or w == k + "s" for w, k in zip(words, wanted)):
             return True
     return False
 
@@ -222,6 +230,7 @@ def qualifying_meetings(config: dict, date_str: str) -> list:
     # token; a calendar an account can't see just 404s and is skipped. Dedup by
     # UID keeps a calendar visible to two accounts from being counted twice.
     extra_calendars = config.get("extra_calendars") or []
+    skips = _skip_lists(config)
     by_uid = {}
     for acct in tokens:
         try:
@@ -248,8 +257,9 @@ def qualifying_meetings(config: dict, date_str: str) -> list:
                     continue    # all-day / date-only event
                 if _self_declined(ev):
                     continue
-                if skip_event(ev.get("summary", ""), config):
-                    continue    # a task block, not a meeting
+                if skip_event(ev.get("summary", ""), config, skips):
+                    log.info(f"Skipping calendar event {ev.get('summary', '')!r} on {date_str}: a task block, not a meeting")
+                    continue
                 guests = _external_guests(ev, owner_emails)
                 if not guests:
                     continue    # no external guest -> not in scope

@@ -261,7 +261,7 @@ That's it — no separate cron job. The sync runs from the tracker's normal send
 
 ### What qualifies
 
-A calendar event is logged when **all** of these hold: it's a timed event (not all-day), not cancelled, you haven't declined it, and it has at least one guest whose email isn't in `owner_emails` (room/resource attendees don't count). The same meeting appearing on several of your calendars is de-duplicated by its iCal UID. Each meeting is classified to a Kimai project+activity by Claude (title + guest domains), falling back to `meetings_project_id/meetings_activity_id`. Already-synced meetings are tracked in `synced_meetings.json` so re-sends never duplicate.
+A calendar event is logged when **all** of these hold: it's a timed event (not all-day), not cancelled, you haven't declined it, and it has at least one guest whose email isn't in `owner_emails` (room/resource attendees don't count). An event that blocks time for a task rather than meeting anyone is skipped: its title matches "Weekly Theme/editorial draft" or an entry in `calendar_skip_titles` word for word, ignoring case, punctuation, a plural "s" and a trailing "(...)". A skipped event never becomes a timesheet, the tracker time logged during it is kept, and `tracker.log` notes each skip. The same meeting appearing on several of your calendars is de-duplicated by its iCal UID. Each meeting is classified to a Kimai project+activity by Claude (title + guest domains), falling back to `meetings_project_id/meetings_activity_id`. Already-synced meetings are tracked in `synced_meetings.json` so re-sends never duplicate.
 
 ### No double counting
 

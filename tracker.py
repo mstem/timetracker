@@ -1559,9 +1559,17 @@ def cmd_self_test() -> int:
     for variant in ("weekly theme / editorial draft", "Weekly Theme + Editorial Draft (CTFG)",
                     "WEEKLY THEME/EDITORIAL DRAFT", "Weekly theme/editorial drafts"):
         check(f"  and so is {variant!r}", sk(variant), True)
-    for meeting in ("Weekly EF leads meeting", "Editorial board", "Theme park planning", "Weekly sync with Daniel"):
+    for meeting in ("Weekly EF leads meeting", "Editorial board", "Theme park planning", "Weekly sync with Daniel",
+                    "Review weekly theme editorial draft with Joe", "Weekly theme / editorial draft sync"):
         check(f"  while a real meeting is not: {meeting!r}", sk(meeting), False)
     check("config can add a title to skip", sk("Deep work block", {"calendar_skip_titles": ["Deep work block"]}), True)
+    check("  and a one-word skip title is not a wildcard",
+          sk("Focus group with funders", {"calendar_skip_titles": ["Focus"]}), False)
+    check("  and a single string is one title, not its letters",
+          (sk("Deep work", {"calendar_skip_titles": "Deep work"}), sk("Q&A w/ Ana", {"calendar_skip_titles": "Deep work"})),
+          (True, False))
+    check("  and a word that only ends in s is not read as a plural",
+          sk("New roundup", {"calendar_skip_titles": ["News roundup"]}), False)
     ev = lambda title: {"status": "confirmed", "summary": title, "iCalUID": title,
                         "start": {"dateTime": "1999-01-05T16:00:00Z"}, "end": {"dateTime": "1999-01-05T16:30:00Z"},
                         "attendees": [{"email": "daniel@civictech.guide"}]}
