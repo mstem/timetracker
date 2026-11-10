@@ -385,8 +385,11 @@ def describe_group(key: str, group: dict) -> str:
     # Whole minutes, as the Sent log line counts them.
     total_minutes = int(group["seconds"] // 60)
     if not named:
-        # An app or site name says where the time went, not what the work was.
-        return f"other {_tag(total_minutes)}"
+        # A terminal key is the project folder, which names the work. An app or
+        # site key ("app:slack", "chrome:docs.google.com") only names the tool.
+        base = key.split(common.TITLE_SEP, 1)[0]
+        label = "other" if ":" in base else base
+        return f"{label} {_tag(total_minutes)}"
     titles = sorted(named, key=lambda t: -named[t])
     mins = _minutes([named[t] for t in titles] + [other], total_minutes)
     other_min = mins.pop()
@@ -1546,11 +1549,14 @@ def cmd_self_test() -> int:
           "Board notes (10m)")
     check("tags count whole minutes the way the log does", dg({"Board notes - Google Chrome - Matt": 1540}),
           "Board notes (25m)")
-    check("a group of only generic titles is other, not the site's name",
+    check("a group of only generic titles in a site is other",
           describe_group("chrome:mail.google.com", {"seconds": 300, "titles": {"Gmail - Google Chrome - Matt": 300}}),
           "other (5m)")
-    check("  nor the app's name",
+    check("  and in an app too",
           describe_group("app:slack", {"seconds": 240, "titles": {"Slack": 240}}), "other (4m)")
+    check("  while a terminal folder keeps its name, which names the project",
+          describe_group("~/projects/timetracker", {"seconds": 600, "titles": {"zsh": 600}}),
+          "~/projects/timetracker (10m)")
     check("a description never holds a line break",
           "\n" in dg({"Find in page\n    Budget 2027 - Google Chrome - Matt": 300}), False)
 
