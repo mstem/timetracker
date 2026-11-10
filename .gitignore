@@ -34,3 +34,4 @@ __pycache__/
 
 # Personal Toggl history (private data, never commit)
 toggl-archive/
+refile-evens-posted.json

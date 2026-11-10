@@ -1348,6 +1348,8 @@ def cmd_self_test() -> int:
           common.rule_activity(nk, 63, hcfg), 76)
     check("  but a CTFG project the model chose keeps its own",
           common.rule_activity(nk, 38, hcfg), None)
+    check("a saved CTFG project with no activity does not borrow the rule's activity",
+          hub_files("✳ Weekly newsletter text with Daniel", {**hmaps, nk: {"project": 38}}), (38, 53))
     check("two projects with no known customer are not the same customer",
           common.enforce_title_rule(nk, 99, hcfg, {23: 4}), 63)
     g_ctfg = {"source": "app", "key": "app:granola", "window": "Daniel / Matt weekly",

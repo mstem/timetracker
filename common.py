@@ -546,7 +546,10 @@ def resolve_mapping(key: str, mappings: dict, default_project, default_activity,
     rule = title_rule(key, config)
     if rule:
         if own.get("project") and _same_customer(own["project"], rule["project"], project_customer):
-            return own["project"], own.get("activity") or rule.get("activity") or default_activity
+            # The rule's activity belongs to the rule's project, so another CTFG
+            # project without its own activity takes the default instead.
+            same = own["project"] == rule["project"]
+            return own["project"], own.get("activity") or (rule.get("activity") if same else None) or default_activity
         return rule["project"], rule.get("activity") or default_activity
     base = mappings.get(key.split(TITLE_SEP, 1)[0]) or {}
     profile = profile_mapping(key, config)

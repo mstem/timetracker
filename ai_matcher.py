@@ -550,7 +550,7 @@ def cmd_match(days: int, dry_run: bool, interactive: bool):
                 continue
 
             if result:
-                activity_id = resolve_activity(result["id"])
+                activity_id = common.rule_activity(key, result["id"], config) or resolve_activity(result["id"])
                 if activity_id:
                     to_save[key] = {"project": result["id"], "activity": activity_id}
                     log.info(f"Matched '{key}' → {result['name']} (interactive)")

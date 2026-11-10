@@ -29,6 +29,8 @@ import json
 import os
 import re
 import sys
+import tempfile
+import urllib.error
 
 import ai_matcher
 import common
@@ -56,13 +58,43 @@ def timesheets(config: dict, first: str, last: str) -> list:
             rows = common.kimai_request(
                 config, "GET",
                 f"/timesheets?begin={first}T00:00:00&end={end}T00:00:00&size=500&page={page}&full=true") or []
-        except Exception:
-            # Kimai answers a page past the end with 404.
-            break
+        except urllib.error.HTTPError as e:
+            # Kimai answers a page past the end with 404. Any other error
+            # would make the plan look empty, so it stops the run.
+            if e.code == 404 and page > 1:
+                break
+            raise
         out += rows
         if len(rows) < 500:
             break
     return out
+
+
+POSTED = "refile-evens-posted.json"
+
+
+def load_posted(folder: str = common.BASE_DIR) -> set:
+    """Ids of the timesheets earlier --apply runs posted. Their descriptions and
+    lengths can match some other Sent line, so a later run skips them instead of
+    splitting them again."""
+    path = os.path.join(folder, POSTED)
+    if not os.path.exists(path):
+        return set()
+    with open(path) as f:
+        return set(json.load(f))
+
+
+def save_posted(ids: set, folder: str = common.BASE_DIR):
+    with open(os.path.join(folder, POSTED), "w") as f:
+        json.dump(sorted(ids), f)
+
+
+def day_log(day: str):
+    path = os.path.join(common.LOGS_DIR, f"{day}.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
 
 
 def group_entries(day_entries: list, key: str, day_keys: set) -> list:
@@ -92,7 +124,10 @@ def plan(config: dict, first: str, last: str, keys: list, evens_project: int) ->
     keys = {common.normalize_key(k) for k in keys}
 
     by_day_desc = collections.defaultdict(list)
+    posted = load_posted()
     for t in timesheets(config, first, last):
+        if t["id"] in posted:
+            continue
         by_day_desc[(t["begin"][:10], t.get("description") or "")].append(t)
 
     sent = sends(first, last)
@@ -122,7 +157,11 @@ def plan(config: dict, first: str, last: str, keys: list, evens_project: int) ->
         if project_customer.get(sheet["project"]["id"]) != evens:
             continue
         if day not in logs:
-            logs[day] = json.load(open(os.path.join(common.LOGS_DIR, f"{day}.json")))
+            logs[day] = day_log(day)
+            if logs[day] is None:
+                print(f"  ! {day}: no log file, its sends are skipped")
+        if logs[day] is None:
+            continue
         entries = group_entries(logs[day], key, day_keys[day])
         base = key.split(common.TITLE_SEP, 1)[0]
         if not entries:
@@ -181,14 +220,18 @@ def show(moves: list):
         print(f"  {name:28} {h:.2f}h")
 
 
-def apply(config: dict, moves: list):
+def apply(config: dict, moves: list, snapshot_dir: str = common.BASE_DIR):
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    snapshot = os.path.join(common.BASE_DIR, f"refile-evens-snapshot-{stamp}.json")
+    snapshot = os.path.join(snapshot_dir, f"refile-evens-snapshot-{stamp}.json")
     with open(snapshot, "w") as f:
         json.dump(moves, f, indent=2, default=str)
     print(f"Snapshot of {len(moves)} timesheet(s) and their planned pieces: {snapshot}")
+    done = load_posted(snapshot_dir)
     for m in moves:
-        common.kimai_request(config, "DELETE", f"/timesheets/{m['sheet']['id']}")
+        # Post every piece first and delete the original only once all of them
+        # landed, so a rejected post never loses the time. A failure rolls back
+        # the pieces already posted for that timesheet and stops the run.
+        posted = []
         tags = ",".join(t if isinstance(t, str) else t.get("name", "") for t in m["sheet"].get("tags") or [])
         for p in m["pieces"]:
             start = common.parse_z(p["start"])
@@ -203,12 +246,89 @@ def apply(config: dict, moves: list):
             }
             if tags:
                 body["tags"] = tags
-            common.kimai_request(config, "POST", "/timesheets", body)
+            try:
+                posted.append(common.kimai_request(config, "POST", "/timesheets", body))
+            except Exception:
+                for new in posted:
+                    if new and new.get("id"):
+                        common.kimai_request(config, "DELETE", f"/timesheets/{new['id']}")
+                print(f"  #{m['sheet']['id']} {m['day']}: a piece was rejected, left as it was; stopping")
+                raise
+        done |= {new["id"] for new in posted if new and new.get("id")}
+        save_posted(done, snapshot_dir)
+        common.kimai_request(config, "DELETE", f"/timesheets/{m['sheet']['id']}")
         print(f"  #{m['sheet']['id']} {m['day']} re-filed into {len(m['pieces'])} timesheet(s)")
+
+
+def self_test() -> int:
+    """Fake Kimai, no network."""
+    import io, urllib.error
+    calls, fails = [], []
+
+    def check(name, got, want):
+        ok = got == want
+        print(("  PASS " if ok else "  FAIL ") + name + ("" if ok else f": got {got!r}, want {want!r}"))
+        if not ok:
+            fails.append(name)
+
+    def fake(pages=None, error=None, post_fails=False):
+        def request(config, method, path, body=None):
+            calls.append((method, path))
+            if method == "GET":
+                page = int(path.rsplit("page=", 1)[1].split("&")[0])
+                if error and page == 1:
+                    raise error
+                if page > len(pages):
+                    raise urllib.error.HTTPError(path, 404, "Not Found", {}, io.BytesIO())
+                return pages[page - 1]
+            if method == "POST" and post_fails:
+                raise urllib.error.HTTPError(path, 400, "Bad Request", {}, io.BytesIO())
+        return request
+
+    real = common.kimai_request
+    try:
+        common.kimai_request = fake(pages=[[{}] * 500, [{}] * 3])
+        check("pages are read until a short page", len(timesheets({}, "2026-01-01", "2026-01-02")), 503)
+        common.kimai_request = fake(pages=[[{}] * 500])
+        check("a 404 past the last page ends paging", len(timesheets({}, "2026-01-01", "2026-01-02")), 500)
+        common.kimai_request = fake(error=urllib.error.HTTPError("x", 401, "Unauthorized", {}, io.BytesIO()))
+        try:
+            timesheets({}, "2026-01-01", "2026-01-02")
+            check("an auth error is raised, not read as no timesheets", "returned", "raised")
+        except urllib.error.HTTPError:
+            check("an auth error is raised, not read as no timesheets", "raised", "raised")
+
+        move = {"day": "2026-01-01", "sheet": {"id": 7, "tags": []}, "pieces": [
+            {"project": 63, "activity": 76, "seconds": 600, "start": "2026-01-01T10:00:00Z", "description": "a"}]}
+        calls.clear()
+        common.kimai_request = fake(post_fails=True)
+        try:
+            apply({"timezone": "UTC"}, [move], snapshot_dir=tempfile.mkdtemp())
+        except Exception:
+            pass
+        check("a rejected post leaves the original timesheet in place",
+              [c for c in calls if c[0] == "DELETE"], [])
+        calls.clear()
+        common.kimai_request = fake()
+        apply({"timezone": "UTC"}, [move], snapshot_dir=tempfile.mkdtemp())
+        check("pieces are posted before the original is deleted",
+              [c[0] for c in calls], ["POST", "DELETE"])
+        d = tempfile.mkdtemp()
+        common.kimai_request = lambda config, method, path, body=None: {"id": 501} if method == "POST" else None
+        apply({"timezone": "UTC"}, [move], snapshot_dir=d)
+        check("posted timesheets are remembered so a later run leaves them alone",
+              load_posted(d), {501})
+    finally:
+        common.kimai_request = real
+    check("a day with no log file gives no entries", day_log("1999-01-01"), None)
+    print(f"{len(fails) == 0 and 'all' or len(fails)} {'passed' if not fails else 'failed'}")
+    return 1 if fails else 0
 
 
 def main():
     ap = argparse.ArgumentParser()
+    if "--self-test" in sys.argv:
+        return self_test()
     ap.add_argument("first")
     ap.add_argument("last")
     ap.add_argument("--keys", nargs="*", default=DEFAULT_KEYS)
