@@ -243,10 +243,14 @@ def kimai_local_time(dt_utc: datetime.datetime, config: dict) -> str:
 # as project-only (the caller falls back to the default activity).
 
 def normalize_mapping_value(val) -> dict:
-    """Coerce a stored mapping value into {"project": id, "activity": id|None}.
+    """Coerce a stored mapping value into {"project": id, "activity": id|None},
+    plus "manual": true on a mapping set by hand.
     Accepts the legacy Clockify form (a bare project-id string) too."""
     if isinstance(val, dict):
-        return {"project": val.get("project"), "activity": val.get("activity")}
+        out = {"project": val.get("project"), "activity": val.get("activity")}
+        if val.get("manual"):
+            out["manual"] = True   # set by hand: beats the CTFG title rule
+        return out
     return {"project": val, "activity": None}   # legacy: bare Clockify project id
 
 
@@ -541,8 +545,13 @@ def resolve_mapping(key: str, mappings: dict, default_project, default_activity,
     Digital citizenry doc stays on Digital citizenry), and overruled when the
     model put a work-profile window under another customer.
 
-    The CTFG title rule comes before all of that."""
+    The CTFG title rule comes before all of that, except for a mapping set
+    by hand."""
     own = mappings.get(key) or {}
+    # A mapping Matt set by hand ("manual": true, written by --link and the
+    # interactive matcher) is the way to correct the rule when it misfires.
+    if own.get("manual") and own.get("project"):
+        return own["project"], own.get("activity") or default_activity
     rule = title_rule(key, config)
     if rule:
         # A specific CTFG project wins over the rule's general one: first the

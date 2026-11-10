@@ -36,17 +36,41 @@ import ai_matcher
 import common
 import tracker
 
-SENT = re.compile(r"Sent \[(\d{4}-\d\d-\d\d)\] '(.*)' \((.*)\) → (\d+)m$")
+SENT = re.compile(r"Sent \[(\d{4}-\d\d-\d\d)\] '(.*)' \((.*)\) → (\d+)m$", re.S)
+LOG_RECORD = re.compile(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3} ")
 DEFAULT_KEYS = ["~/projects/hub", "~/projects/daily-briefing"]
 
 
-def sends(first: str, last: str) -> list:
+def sends(first: str, last: str, path: str = None) -> list:
+    """(day, description, key, minutes) per Sent line. A window title with a
+    line break in it carries over onto the following log lines, so an
+    unfinished Sent line runs on to the next timestamped log record."""
     out = []
-    with open(tracker.LOG_FILE, errors="replace") as f:
-        for line in f:
-            m = SENT.search(line.rstrip("\n"))
-            if m and first <= m.group(1) <= last:
-                out.append((m.group(1), m.group(2), m.group(3), int(m.group(4))))
+    with open(path or tracker.LOG_FILE, errors="replace") as f:
+        lines = f.read().split("\n")
+    i = 0
+    while i < len(lines):
+        text = lines[i]
+        m = SENT.search(text)
+        if not m and "INFO Sent [" in text:
+            extra = 0
+            while True:
+                extra += 1
+                # A line with its own timestamp is the next log record, so the
+                # unfinished one ended there.
+                if i + extra >= len(lines) or LOG_RECORD.match(lines[i + extra]):
+                    break
+                text += "\n" + lines[i + extra]
+                m = SENT.search(text)
+                if m:
+                    i += extra
+                    break
+            day = re.search(r"Sent \[(\d{4}-\d\d-\d\d)\]", text)
+            if not m and day and first <= day.group(1) <= last:
+                print(f"  ! unreadable Sent line, skipped: {lines[i][:100]}")
+        if m and first <= m.group(1) <= last:
+            out.append((m.group(1), m.group(2), m.group(3), int(m.group(4))))
+        i += 1
     return out
 
 
@@ -516,6 +540,24 @@ def self_test() -> int:
         common.kimai_request = real
     check("a piece that cannot be taken back is recorded so later runs leave it alone",
           load_posted(d), {951})
+    log = os.path.join(tempfile.mkdtemp(), "tracker.log")
+    with open(log, "w") as f:
+        f.write("2026-11-07 00:00:16,083 INFO Sent [2026-11-06] 'Find in page\n"
+                "    EVENS' (chrome:us19.admin.mailchimp.com) \u2192 15m\n"
+                "2026-11-07 00:00:17,000 INFO Sent [2026-11-06] 'Inbox' (chrome:mail.google.com) \u2192 3m\n")
+    with open(log, "a") as f:
+        f.write("2026-11-07 00:00:18,000 INFO Sent [2026-11-07] 'Cut off\n"
+                "2026-11-07 00:00:19,000 INFO Sent [2026-11-07] 'Gmail' (chrome:mail.google.com) \u2192 2m\n")
+    with open(log, "a") as f:
+        f.write("2026-11-08 00:00:20,000 INFO Sent [2026-11-08] 'One\nTwo\nThree\nFour\nFive' (chrome:x) \u2192 4m\n")
+    check("a title with many line breaks is still read",
+          sends("2026-11-08", "2026-11-08", log), [("2026-11-08", "One\nTwo\nThree\nFour\nFive", "chrome:x", 4)])
+    check("a cut-off Sent line never swallows the next one",
+          sends("2026-11-07", "2026-11-07", log), [("2026-11-07", "Gmail", "chrome:mail.google.com", 2)])
+    check("a Sent line whose description spans two lines is read whole",
+          sends("2026-11-06", "2026-11-06", log),
+          [("2026-11-06", "Find in page\n    EVENS", "chrome:us19.admin.mailchimp.com", 15),
+           ("2026-11-06", "Inbox", "chrome:mail.google.com", 3)])
     check("a day with no log file gives no entries", day_log("1999-01-01"), None)
     print(f"{len(fails) == 0 and 'all' or len(fails)} {'passed' if not fails else 'failed'}")
     return 1 if fails else 0

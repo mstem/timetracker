@@ -293,7 +293,7 @@ def append_activity(path: str, activity: ActivityState, start: datetime.datetime
 def cmd_map(key: str, project_id: str, activity_id: str):
     key = common.normalize_key(key)
     mappings = common.load_project_mappings()
-    mappings[key] = {"project": int(project_id), "activity": int(activity_id)}
+    mappings[key] = {"project": int(project_id), "activity": int(activity_id), "manual": True}
     common.save_project_mappings(mappings)
     print(f"Mapped '{key}' → project {project_id}, activity {activity_id}")
 
@@ -1362,6 +1362,31 @@ def cmd_self_test() -> int:
                     {"~/projects/ctfg-curator": {"project": 63, "activity": 76},
                      "~/projects/ctfg-curator | ctfg curator taxonomy": {"project": 38, "activity": 37}},
                     key="~/projects/ctfg-curator"), (38, 37))
+    check("a mapping set by hand beats the CTFG rule",
+          hub_files("✳ Weekly newsletter text with Daniel",
+                    {**hmaps, nk: {"project": 23, "activity": 22, "manual": True}}), (23, 22))
+    check("  while the same mapping saved by the model does not",
+          hub_files("✳ Weekly newsletter text with Daniel",
+                    {**hmaps, nk: {"project": 23, "activity": 22}}), (63, 76))
+    check("a hand-set mapping beats the Chrome profile too",
+          common.resolve_mapping("chrome:internal | ctfg budget with daniel - google chrome - civictech.guide",
+                                 {"chrome:internal | ctfg budget with daniel - google chrome - civictech.guide":
+                                  {"project": 23, "activity": 22, "manual": True}}, 53, 53,
+                                 {**hcfg, "profile_projects": [{"suffix": "google chrome - civictech.guide",
+                                                                "project": 63, "activity": 76}]}, hpc), (23, 22))
+    check("a hand-set mapping to the default project is kept",
+          hub_files("✳ Weekly newsletter text with Daniel",
+                    {**hmaps, nk: {"project": 53, "activity": 53, "manual": True}}), (53, 53))
+    prop = {"id": 63, "name": "CTFG general bucket"}
+    check("accepting the model's proposal in the interactive matcher is not a hand-set mapping",
+          ai_matcher.hand_set(prop, prop), False)
+    check("  typing another project is", ai_matcher.hand_set({"id": 38, "name": "Newsletter"}, prop), True)
+    check("  and so is typing one where the model had none", ai_matcher.hand_set({"id": 38}, None), True)
+    check("the hand-set mark survives loading and saving the mappings file",
+          common.normalize_mapping_value({"project": 23, "activity": 22, "manual": True}),
+          {"project": 23, "activity": 22, "manual": True})
+    check("  and stays off mappings that never had it",
+          common.normalize_mapping_value({"project": 23, "activity": 22}), {"project": 23, "activity": 22})
     check("two projects with no known customer are not the same customer",
           common.enforce_title_rule(nk, 99, hcfg, {23: 4}), 63)
     g_ctfg = {"source": "app", "key": "app:granola", "window": "Daniel / Matt weekly",
