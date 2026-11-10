@@ -468,6 +468,73 @@ def normalize_title(title: str) -> str:
     return normalize_key(t)
 
 
+# Titles as they go into a Kimai description: readable, in their own case, with
+# the window furniture off and nothing secret left in.
+_CHROME_TAIL = re.compile(r"(\s+-\s+Google Chrome)?(\s+-\s+Matt(\s+\([^)]*\))?)?\s*$")
+_GROUP = re.compile(r"\s+-\s+Part of group [^-]*?(?=\s+-\s|$)", re.I)
+_WINDOW_NAMES = re.compile(r"(\s+-\s+(EVENS|personal))+\s*$")
+_MAIL_TAIL = re.compile(r"\s+-\s+[\w.+-]+@[\w.-]+(\s+-\s+.*)?$")
+_SLACK = re.compile(r"^(?:\*\s*)?(.+?)\s+\((DM|Channel)\)\s+-\s+.*-\s+Slack$|^(?:\*\s*)?(.+?)\s+-\s+.*-\s+Slack$")
+_SECRET = re.compile(r"\b(sign[- ]?in|verification|security|login|one[- ]time|confirmation|access)\s+code\b"
+                     r"|\b(otp|passcode|2fa)\b|\b\d{6,8}\b.*\bcode\b|\bcode\b.*\b\d{6,8}\b"
+                     r"|[?&](token|code|key|auth|sig|signature|password|secret)=", re.I)
+_URL = re.compile(r"https?://\S+")
+_GENERIC_DISPLAY = re.compile(
+    r"^(new tab|evens|personal|inbox|gmail|google|search results|log ?in|sign ?in|sign up|login|"
+    r"find in page.*|claude code|untitled|loading.*|\S+ is sharing (a window|your screen)\.?|"
+    r"to save your password.*|.*\blog ?in( or sign ?up)?\b.*|.*\bsign ?in\b.*)$", re.I)
+_SPINNER = re.compile(r"^[\u2733\u25d0-\u25d3\u2800-\u28ff]+\s*")
+TITLE_DISPLAY_MAX = 120
+
+
+def clean_title(title: str) -> str:
+    """A window title the way a person would name the work, or "" when nothing
+    in it does. Used for Kimai descriptions, which other models read to judge
+    the time, so it keeps the title's own case and never carries a sign-in
+    code, a one-time password or a URL."""
+    raw = (title or "").replace("\u200b", "")
+    if "(incognito)" in raw.lower() or _SECRET.search(raw):
+        return ""
+    t = re.sub(r"\s+", " ", raw).strip()
+    if t.lower().startswith("find in page"):
+        return ""
+    session = bool(_SPINNER.match(t))
+    t = _SPINNER.sub("", t)
+    t = _TITLE_UNREAD.sub("", t)
+    t = _TITLE_SIZE.sub("", t)
+    t = _URL.sub("", t)
+    slack = _SLACK.match(t) if t.endswith(" - Slack") else None
+    if slack:
+        if slack.group(2) == "DM":
+            t = "Slack DM: " + slack.group(1)
+        elif slack.group(2) == "Channel":
+            t = "Slack: #" + slack.group(1)
+        else:
+            t = "Slack: " + slack.group(3)
+    else:
+        for pattern in _TITLE_VOLATILE:
+            t = pattern.sub("", t)
+        t = _GROUP.sub("", t)
+        t = _CHROME_TAIL.sub("", t)
+        t = _WINDOW_NAMES.sub("", t)
+        if _MAIL_TAIL.search(t):
+            # Gmail: "<subject or folder> (12) - <address> - <mailbox>".
+            t = re.sub(r"\s\(\d[\d,]*\)$", "", _MAIL_TAIL.sub("", t))
+        if t.startswith("Meet \u2013 "):
+            t = t[len("Meet \u2013 "):]
+            # Meet repeats its own name in the title: "X - Meet – X".
+            t = t.split(" - Meet \u2013 ", 1)[0]
+    t = re.sub(r"\s+", " ", t).strip(" -")
+    t = t.replace("; ", ", ")
+    if not t or len(t) <= 2 or _GENERIC_DISPLAY.match(t) or t.lower() in _GENERIC_TITLES:
+        return ""
+    if len(t) > TITLE_DISPLAY_MAX:
+        t = t[:TITLE_DISPLAY_MAX - 1].rstrip() + "\u2026"
+    # Claude Code session titles keep their mark, and every spinner state of
+    # one session reads as the same title.
+    return "\u2733 " + t if session else t
+
+
 def profile_mapping(key: str, config: dict) -> dict:
     """The mapping for the Chrome profile named at the end of a title key, from
     `profile_projects` in config.json, or {}. A Chrome title ends with its

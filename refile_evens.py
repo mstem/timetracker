@@ -239,7 +239,8 @@ def plan(config: dict, first: str, last: str, keys: list, evens_project: int) ->
         out.append({"sheet": sheet, "key": key, "day": day, "pieces": [
             {"project": proj, "activity": act, "project_name": names.get(proj, str(proj)),
              "seconds": whole_seconds[(proj, act)], "start": p["start"],
-             "description": p["titles"].most_common(1)[0][0],
+             "description": tracker.describe_group(key, {"seconds": whole_seconds[(proj, act)],
+                                                         "titles": dict(p["titles"])}),
              "titles": {t: round(s / 60, 1) for t, s in p["titles"].most_common()}}
             for (proj, act), p in pieces.items()]})
     return out
