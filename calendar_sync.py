@@ -28,6 +28,7 @@ Already-synced meetings are tracked in synced_meetings.json so re-sends don't du
 import datetime
 import http.server
 import json
+import re
 import logging
 import os
 import socket
@@ -182,6 +183,29 @@ def _self_declined(event: dict) -> bool:
     return False
 
 
+# Calendar events that block time for a task rather than meet anyone. They
+# never become Kimai timesheets, and the work logged during them stands.
+# config.json can add more under "calendar_skip_titles".
+DEFAULT_SKIP_TITLES = ["Weekly Theme/editorial draft"]
+
+
+def _title_words(title: str) -> set:
+    # Lowercase words with a plural "s" off, so "drafts" matches "draft".
+    return {w[:-1] if len(w) > 3 and w.endswith("s") else w
+            for w in re.findall(r"[a-z0-9]+", (title or "").lower())}
+
+
+def skip_event(summary: str, config: dict) -> bool:
+    """True when every word of a skip title is in the event's title, so small
+    variants ("weekly theme / editorial draft", "... (CTFG)") match too."""
+    words = _title_words(summary)
+    for title in DEFAULT_SKIP_TITLES + list(config.get("calendar_skip_titles") or []):
+        wanted = _title_words(title)
+        if wanted and wanted <= words:
+            return True
+    return False
+
+
 def qualifying_meetings(config: dict, date_str: str) -> list:
     """Return de-duplicated external meetings for the day, each as a dict with
     start/end (naive UTC datetimes), summary, uid, and external guest emails."""
@@ -224,6 +248,8 @@ def qualifying_meetings(config: dict, date_str: str) -> list:
                     continue    # all-day / date-only event
                 if _self_declined(ev):
                     continue
+                if skip_event(ev.get("summary", ""), config):
+                    continue    # a task block, not a meeting
                 guests = _external_guests(ev, owner_emails)
                 if not guests:
                     continue    # no external guest -> not in scope

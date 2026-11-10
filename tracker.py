@@ -1552,6 +1552,30 @@ def cmd_self_test() -> int:
     check("a description never holds a line break",
           "\n" in dg({"Find in page\n    Budget 2027 - Google Chrome - Matt": 300}), False)
 
+    # Calendar events that are task blocks, not meetings, never reach Kimai
+    import calendar_sync
+    sk = lambda title, cfg=None: calendar_sync.skip_event(title, cfg or {})
+    check("a task-block calendar event is skipped", sk("Weekly Theme/editorial draft"), True)
+    for variant in ("weekly theme / editorial draft", "Weekly Theme + Editorial Draft (CTFG)",
+                    "WEEKLY THEME/EDITORIAL DRAFT", "Weekly theme/editorial drafts"):
+        check(f"  and so is {variant!r}", sk(variant), True)
+    for meeting in ("Weekly EF leads meeting", "Editorial board", "Theme park planning", "Weekly sync with Daniel"):
+        check(f"  while a real meeting is not: {meeting!r}", sk(meeting), False)
+    check("config can add a title to skip", sk("Deep work block", {"calendar_skip_titles": ["Deep work block"]}), True)
+    ev = lambda title: {"status": "confirmed", "summary": title, "iCalUID": title,
+                        "start": {"dateTime": "1999-01-05T16:00:00Z"}, "end": {"dateTime": "1999-01-05T16:30:00Z"},
+                        "attendees": [{"email": "daniel@civictech.guide"}]}
+    real_cal = (calendar_sync._load_tokens, calendar_sync._access_token, calendar_sync._list_events)
+    calendar_sync._load_tokens = lambda: [{"email": "matt@x", "refresh_token": "r"}]
+    calendar_sync._access_token = lambda config, token: "t"
+    calendar_sync._list_events = lambda token, a, b, cal="primary": (
+        [ev("Weekly Theme/editorial draft"), ev("Call with Daniel")] if cal == "primary" else [])
+    try:
+        got = [m["summary"] for m in calendar_sync.qualifying_meetings({"owner_emails": ["matt@x"], "timezone": "UTC"}, "1999-01-05")]
+    finally:
+        calendar_sync._load_tokens, calendar_sync._access_token, calendar_sync._list_events = real_cal
+    check("a skipped event neither syncs nor hides the work logged during it", got, ["Call with Daniel"])
+
     SENT_FILE = real_sent_file
     logging.disable(logging.NOTSET)
     failed = [r for r in results if not r[1]]
