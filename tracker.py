@@ -1500,10 +1500,13 @@ def cmd_self_test() -> int:
     check("a sign-in code never reaches a description",
           ct("Your sign in code for Evens Foundation is 168622 - matt.stempeck@evensfoundation.eu - Stichting Evens Mail - Google Chrome - Matt (evensfoundation.eu)"), "")
     for secret in ("Your verification code is 482913", "123456 is your Google verification code",
+                   "Use 482913 to sign in to Evens", "Your code for Evens Foundation: 4821",
+                   "Your OTP - Google Chrome - Matt", "Passcode for the board meeting",
+                   "2FA backup codes 48213 91822 - Google Chrome - Matt",
                    "Reset link https://example.com/reset?token=abc123def - Google Chrome - Matt"):
         check(f"  nor {secret[:30]!r}", ct(secret), "")
     for work in ("\u2733 Fix sign in page", "Login flow redesign - Google Docs - Google Chrome - Matt",
-                 "Access code review for repo - Google Chrome - Matt", "Order 12345678 shipping code - Google Chrome - Matt"):
+                 "Access code review for repo - Google Chrome - Matt", "\u2733 Code review for the 2026 budget"):
         check(f"  while a work title is kept: {work[:30]!r}", ct(work) != "", True)
     check("a semicolon without a space cannot split it either", ";" in ct("Retro (5m);actions - Google Chrome - Matt"), False)
     check("an incognito title is never named", ct("Bank - Google Chrome - Matt (Incognito)"), "")

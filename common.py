@@ -475,11 +475,16 @@ _GROUP = re.compile(r"\s+-\s+Part of group [^-]*?(?=\s+-\s|$)", re.I)
 _WINDOW_NAMES = re.compile(r"(\s+-\s+(EVENS|personal))+\s*$")
 _MAIL_TAIL = re.compile(r"\s+-\s+[\w.+-]+@[\w.-]+(\s+-\s+.*)?$")
 _SLACK = re.compile(r"^(?:\*\s*)?(.+?)\s+\((DM|Channel)\)\s+-\s+.*-\s+Slack$|^(?:\*\s*)?(.+?)\s+-\s+.*-\s+Slack$")
-# A code someone sent to sign in: "Your sign in code ... is 168622", "123456 is
-# your verification code", "code: 4821". A title that only mentions codes
-# ("Access code review") holds no secret and stays.
-_SECRET = re.compile(r"\b(sign[- ]?in|verification|security|login|one[- ]time|confirmation|access|auth)\s+code\b.*\b\d{4,8}\b"
-                     r"|\b\d{4,8}\b\s+is\s+your\b|\b(code|otp|passcode|pin)\s*(is|:)\s*\d{4,8}\b"
+# Anything that may carry a code someone sent to sign in. This fails closed: a
+# one-time-password word drops the title outright, and so does a 4-8 digit
+# number (years aside) within a few words of "code", "sign in", "log in" or
+# "verify", in either order. A work title that only mentions codes and has no
+# such number ("Access code review") stays.
+_CODE_NUMBER = r"\b(?!(?:19|20)\d\d\b)\d{4,8}\b"
+_CODE_WORD = r"\b(?:codes?|sign[- ]?in|log[- ]?in|verif\w*)\b"
+_SECRET = re.compile(r"\b(otp|passcode|2fa|mfa|one[- ]time password)\b"
+                     rf"|{_CODE_WORD}\W+(?:\w+\W+){{0,6}}?{_CODE_NUMBER}"
+                     rf"|{_CODE_NUMBER}\W+(?:\w+\W+){{0,6}}?{_CODE_WORD}"
                      r"|[?&](token|code|key|auth|sig|signature|password|secret)=", re.I)
 _URL = re.compile(r"https?://\S+")
 # Titles that name no work. A sign-in page is "Log in - Combell nv", "Sign in to
