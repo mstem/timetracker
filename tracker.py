@@ -1368,6 +1368,15 @@ def cmd_self_test() -> int:
     check("  while the same mapping saved by the model does not",
           hub_files("✳ Weekly newsletter text with Daniel",
                     {**hmaps, nk: {"project": 23, "activity": 22}}), (63, 76))
+    check("a hand-set mapping beats the Chrome profile too",
+          common.resolve_mapping("chrome:internal | ctfg budget with daniel - google chrome - civictech.guide",
+                                 {"chrome:internal | ctfg budget with daniel - google chrome - civictech.guide":
+                                  {"project": 23, "activity": 22, "manual": True}}, 53, 53,
+                                 {**hcfg, "profile_projects": [{"suffix": "google chrome - civictech.guide",
+                                                                "project": 63, "activity": 76}]}, hpc), (23, 22))
+    check("a hand-set mapping to the default project is kept",
+          hub_files("✳ Weekly newsletter text with Daniel",
+                    {**hmaps, nk: {"project": 53, "activity": 53, "manual": True}}), (53, 53))
     check("the hand-set mark survives loading and saving the mappings file",
           common.normalize_mapping_value({"project": 23, "activity": 22, "manual": True}),
           {"project": 23, "activity": 22, "manual": True})

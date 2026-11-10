@@ -37,6 +37,7 @@ import common
 import tracker
 
 SENT = re.compile(r"Sent \[(\d{4}-\d\d-\d\d)\] '(.*)' \((.*)\) → (\d+)m$", re.S)
+LOG_RECORD = re.compile(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3} ")
 DEFAULT_KEYS = ["~/projects/hub", "~/projects/daily-briefing"]
 
 
@@ -53,13 +54,17 @@ def sends(first: str, last: str, path: str = None) -> list:
         m = SENT.search(text)
         if not m and "INFO Sent [" in text:
             for extra in range(1, 4):
-                if i + extra >= len(lines):
+                # A line with its own timestamp is the next log record, so the
+                # unfinished one ended there.
+                if i + extra >= len(lines) or LOG_RECORD.match(lines[i + extra]):
                     break
                 text += "\n" + lines[i + extra]
                 m = SENT.search(text)
                 if m:
                     i += extra
                     break
+            if not m:
+                print(f"  ! unreadable Sent line, skipped: {lines[i][:100]}")
         if m and first <= m.group(1) <= last:
             out.append((m.group(1), m.group(2), m.group(3), int(m.group(4))))
         i += 1
@@ -537,6 +542,11 @@ def self_test() -> int:
         f.write("2026-11-07 00:00:16,083 INFO Sent [2026-11-06] 'Find in page\n"
                 "    EVENS' (chrome:us19.admin.mailchimp.com) \u2192 15m\n"
                 "2026-11-07 00:00:17,000 INFO Sent [2026-11-06] 'Inbox' (chrome:mail.google.com) \u2192 3m\n")
+    with open(log, "a") as f:
+        f.write("2026-11-07 00:00:18,000 INFO Sent [2026-11-07] 'Cut off\n"
+                "2026-11-07 00:00:19,000 INFO Sent [2026-11-07] 'Gmail' (chrome:mail.google.com) \u2192 2m\n")
+    check("a cut-off Sent line never swallows the next one",
+          sends("2026-11-07", "2026-11-07", log), [("2026-11-07", "Gmail", "chrome:mail.google.com", 2)])
     check("a Sent line whose description spans two lines is read whole",
           sends("2026-11-06", "2026-11-06", log),
           [("2026-11-06", "Find in page\n    EVENS", "chrome:us19.admin.mailchimp.com", 15),

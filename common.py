@@ -550,7 +550,9 @@ def resolve_mapping(key: str, mappings: dict, default_project, default_activity,
     own = mappings.get(key) or {}
     # A mapping Matt set by hand ("manual": true, written by --link and the
     # interactive matcher) is the way to correct the rule when it misfires.
-    rule = None if own.get("manual") else title_rule(key, config)
+    if own.get("manual") and own.get("project"):
+        return own["project"], own.get("activity") or default_activity
+    rule = title_rule(key, config)
     if rule:
         # A specific CTFG project wins over the rule's general one: first the
         # title's own, then its profile's or its folder's. The title's own
