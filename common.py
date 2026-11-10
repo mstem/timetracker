@@ -475,14 +475,20 @@ _GROUP = re.compile(r"\s+-\s+Part of group [^-]*?(?=\s+-\s|$)", re.I)
 _WINDOW_NAMES = re.compile(r"(\s+-\s+(EVENS|personal))+\s*$")
 _MAIL_TAIL = re.compile(r"\s+-\s+[\w.+-]+@[\w.-]+(\s+-\s+.*)?$")
 _SLACK = re.compile(r"^(?:\*\s*)?(.+?)\s+\((DM|Channel)\)\s+-\s+.*-\s+Slack$|^(?:\*\s*)?(.+?)\s+-\s+.*-\s+Slack$")
-_SECRET = re.compile(r"\b(sign[- ]?in|verification|security|login|one[- ]time|confirmation|access)\s+code\b"
-                     r"|\b(otp|passcode|2fa)\b|\b\d{6,8}\b.*\bcode\b|\bcode\b.*\b\d{6,8}\b"
+# A code someone sent to sign in: "Your sign in code ... is 168622", "123456 is
+# your verification code", "code: 4821". A title that only mentions codes
+# ("Access code review") holds no secret and stays.
+_SECRET = re.compile(r"\b(sign[- ]?in|verification|security|login|one[- ]time|confirmation|access|auth)\s+code\b.*\b\d{4,8}\b"
+                     r"|\b\d{4,8}\b\s+is\s+your\b|\b(code|otp|passcode|pin)\s*(is|:)\s*\d{4,8}\b"
                      r"|[?&](token|code|key|auth|sig|signature|password|secret)=", re.I)
 _URL = re.compile(r"https?://\S+")
+# Titles that name no work. A sign-in page is "Log in - Combell nv", "Sign in to
+# GitHub" or "LinkedIn: Log In or Sign Up"; "Fix sign in page" is work.
 _GENERIC_DISPLAY = re.compile(
-    r"^(new tab|evens|personal|inbox|gmail|google|search results|log ?in|sign ?in|sign up|login|"
-    r"find in page.*|claude code|untitled|loading.*|\S+ is sharing (a window|your screen)\.?|"
-    r"to save your password.*|.*\blog ?in( or sign ?up)?\b.*|.*\bsign ?in\b.*)$", re.I)
+    r"^(new tab|evens|personal|inbox|gmail|google|search results|untitled|claude code|loading.*"
+    r"|find in page.*|\S+ is sharing (a window|your screen)\.?|to save your password.*"
+    r"|(log ?in|sign ?in|sign up|login)(\s+(-|to|\||\u2013)\s+.*)?"
+    r"|.*:\s*(log ?in|sign ?in)(\s+or\s+sign ?up)?)$", re.I)
 _SPINNER = re.compile(r"^[\u2733\u25d0-\u25d3\u2800-\u28ff]+\s*")
 TITLE_DISPLAY_MAX = 120
 
@@ -525,7 +531,9 @@ def clean_title(title: str) -> str:
             # Meet repeats its own name in the title: "X - Meet – X".
             t = t.split(" - Meet \u2013 ", 1)[0]
     t = re.sub(r"\s+", " ", t).strip(" -")
-    t = t.replace("; ", ", ")
+    # daily-briefing splits a description at a ";" after a tag, so none may be
+    # left inside a title.
+    t = re.sub(r"\s*;\s*", ", ", t)
     if not t or len(t) <= 2 or _GENERIC_DISPLAY.match(t) or t.lower() in _GENERIC_TITLES:
         return ""
     if len(t) > TITLE_DISPLAY_MAX:

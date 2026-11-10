@@ -356,7 +356,10 @@ def _tag(minutes: int) -> str:
 def _minutes(seconds: list, total_minutes: int) -> list:
     """Whole minutes per entry that add up to total_minutes: each gets its
     floor, and the leftover minutes go to the largest remainders."""
-    total = sum(seconds) or 1
+    total = sum(seconds)
+    if not total:
+        # Nothing to weigh by: the minutes go to the first entry.
+        return [total_minutes] + [0] * (len(seconds) - 1)
     exact = [s * total_minutes / total for s in seconds]
     out = [int(x) for x in exact]
     for i in sorted(range(len(exact)), key=lambda i: out[i] - exact[i])[:total_minutes - sum(out)]:
@@ -379,7 +382,8 @@ def describe_group(key: str, group: dict) -> str:
             named[clean] += secs
         else:
             other += secs
-    total_minutes = round(group["seconds"] / 60)
+    # Whole minutes, as the Sent log line counts them.
+    total_minutes = int(group["seconds"] // 60)
     if not named:
         label = key.split(common.TITLE_SEP, 1)[0].split(":", 1)[-1]
         return f"{label} {_tag(total_minutes)}"
@@ -395,8 +399,11 @@ def describe_group(key: str, group: dict) -> str:
             continue
         parts.append(segment)
     if not parts:
-        parts.append(f"{titles[0][:DESCRIPTION_MAX - 20]} {_tag(mins[0])}")
-        other_min -= mins[0]
+        # No title earned a minute of its own: the longest one takes one from
+        # "other" when there is one, so the description still names the work.
+        first = 1 if other_min else 0
+        parts.append(f"{titles[0][:DESCRIPTION_MAX - 20]} {_tag(first)}")
+        other_min -= first
     if other_min:
         parts.append(f"other {_tag(other_min)}")
     return "; ".join(parts)
@@ -1494,7 +1501,11 @@ def cmd_self_test() -> int:
           ct("Your sign in code for Evens Foundation is 168622 - matt.stempeck@evensfoundation.eu - Stichting Evens Mail - Google Chrome - Matt (evensfoundation.eu)"), "")
     for secret in ("Your verification code is 482913", "123456 is your Google verification code",
                    "Reset link https://example.com/reset?token=abc123def - Google Chrome - Matt"):
-        check(f"  nor {secret[:30]!r}", "48291" in ct(secret) or "123456" in ct(secret) or "token" in ct(secret), False)
+        check(f"  nor {secret[:30]!r}", ct(secret), "")
+    for work in ("\u2733 Fix sign in page", "Login flow redesign - Google Docs - Google Chrome - Matt",
+                 "Access code review for repo - Google Chrome - Matt", "Order 12345678 shipping code - Google Chrome - Matt"):
+        check(f"  while a work title is kept: {work[:30]!r}", ct(work) != "", True)
+    check("a semicolon without a space cannot split it either", ";" in ct("Retro (5m);actions - Google Chrome - Matt"), False)
     check("an incognito title is never named", ct("Bank - Google Chrome - Matt (Incognito)"), "")
     check("a semicolon inside a title cannot split the description",
           ct("NLnet; Apply for a grant - Google Chrome - Matt"), "NLnet, Apply for a grant")
@@ -1516,12 +1527,19 @@ def cmd_self_test() -> int:
     def tag_minutes(d):
         return sum(int(h or 0) * 60 + int(m or 0) for h, m in re.findall(r"\((?:(\d+)h)?(?:(\d+)m)?\)(?:; |$)", d))
     mixed = {f"Doc number {i} - Google Chrome - Matt": 100 + 37 * i for i in range(9)}
-    check("the tags add up to the timesheet's minutes", tag_minutes(dg(mixed)), round(sum(mixed.values()) / 60))
+    check("the tags add up to the timesheet's minutes", tag_minutes(dg(mixed)), sum(mixed.values()) // 60)
     many = {f"A long document title that keeps going for a while, number {i} - Google Chrome - Matt": 600 - i for i in range(30)}
     long_d = dg(many)
     check("a long list stops short of 500 characters", len(long_d) <= 500, True)
-    check("  and its tags still add up", tag_minutes(long_d), round(sum(many.values()) / 60))
+    check("  and its tags still add up", tag_minutes(long_d), sum(many.values()) // 60)
     check("  and it ends with other", long_d.rsplit("; ", 1)[1].startswith("other ("), True)
+    check("a named title too small for a minute of its own still gets one when there is one",
+          dg({"Board notes - Google Chrome - Matt": 20, "New Tab": 580}), "Board notes (1m); other (9m)")
+    check("titles with no seconds still leave tags that add up",
+          describe_group("chrome:x", {"seconds": 600, "titles": {"Board notes - Google Chrome - Matt": 0}}),
+          "Board notes (10m)")
+    check("tags count whole minutes the way the log does", dg({"Board notes - Google Chrome - Matt": 1540}),
+          "Board notes (25m)")
     check("a group of only generic titles is named by its key",
           describe_group("chrome:mail.google.com", {"seconds": 300, "titles": {"Gmail - Google Chrome - Matt": 300}}),
           "mail.google.com (5m)")
