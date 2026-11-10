@@ -194,9 +194,10 @@ def plan(config: dict, first: str, last: str, keys: list, evens_project: int) ->
             p["start"] = min(p["start"] or e["start"], e["start"])
         if sum(p["seconds"] for t, p in pieces.items() if t != current) < 30:
             continue
+        whole_seconds = dict(zip(pieces, split_seconds(sheet["duration"], [p["seconds"] for p in pieces.values()])))
         out.append({"sheet": sheet, "key": key, "day": day, "pieces": [
             {"project": proj, "activity": act, "project_name": names.get(proj, str(proj)),
-             "seconds": round(p["seconds"]), "start": p["start"],
+             "seconds": whole_seconds[(proj, act)], "start": p["start"],
              "description": p["titles"].most_common(1)[0][0],
              "titles": {t: round(s / 60, 1) for t, s in p["titles"].most_common()}}
             for (proj, act), p in pieces.items()]})
@@ -218,6 +219,22 @@ def show(moves: list):
     print("\nHours leaving Evens projects, by destination:")
     for name, h in sorted(moved.items(), key=lambda kv: -kv[1]):
         print(f"  {name:28} {h:.2f}h")
+
+
+def take_back(config: dict, posted: list):
+    for new in posted:
+        if new and new.get("id"):
+            common.kimai_request(config, "DELETE", f"/timesheets/{new['id']}")
+
+
+def split_seconds(duration: int, weights: list) -> list:
+    """Whole seconds per weight that add up to duration exactly; the rounding
+    remainder goes to the largest piece."""
+    total = sum(weights) or 1
+    out = [round(duration * w / total) for w in weights]
+    if out:
+        out[max(range(len(out)), key=lambda i: weights[i])] += duration - sum(out)
+    return out
 
 
 def apply(config: dict, moves: list, snapshot_dir: str = common.BASE_DIR):
@@ -249,14 +266,18 @@ def apply(config: dict, moves: list, snapshot_dir: str = common.BASE_DIR):
             try:
                 posted.append(common.kimai_request(config, "POST", "/timesheets", body))
             except Exception:
-                for new in posted:
-                    if new and new.get("id"):
-                        common.kimai_request(config, "DELETE", f"/timesheets/{new['id']}")
+                take_back(config, posted)
                 print(f"  #{m['sheet']['id']} {m['day']}: a piece was rejected, left as it was; stopping")
                 raise
+        try:
+            common.kimai_request(config, "DELETE", f"/timesheets/{m['sheet']['id']}")
+        except Exception:
+            # The original is still there, so its pieces would count the time twice.
+            take_back(config, posted)
+            print(f"  #{m['sheet']['id']} {m['day']}: could not delete the original, its pieces taken back; stopping")
+            raise
         done |= {new["id"] for new in posted if new and new.get("id")}
         save_posted(done, snapshot_dir)
-        common.kimai_request(config, "DELETE", f"/timesheets/{m['sheet']['id']}")
         print(f"  #{m['sheet']['id']} {m['day']} re-filed into {len(m['pieces'])} timesheet(s)")
 
 
@@ -318,8 +339,26 @@ def self_test() -> int:
         apply({"timezone": "UTC"}, [move], snapshot_dir=d)
         check("posted timesheets are remembered so a later run leaves them alone",
               load_posted(d), {501})
+        calls.clear()
+        d = tempfile.mkdtemp()
+        def delete_fails(config, method, path, body=None):
+            calls.append((method, path))
+            if method == "POST":
+                return {"id": 601}
+            if path == "/timesheets/7":
+                raise urllib.error.HTTPError(path, 500, "Server Error", {}, io.BytesIO())
+        common.kimai_request = delete_fails
+        try:
+            apply({"timezone": "UTC"}, [move], snapshot_dir=d)
+        except Exception:
+            pass
+        check("a failed delete of the original takes its new pieces back out",
+              ([c for c in calls if c[0] == "DELETE"], load_posted(d)),
+              ([("DELETE", "/timesheets/7"), ("DELETE", "/timesheets/601")], set()))
     finally:
         common.kimai_request = real
+    check("pieces add up to the original duration to the second",
+          sum(split_seconds(1802, [1, 1, 1, 1])), 1802)
     check("a day with no log file gives no entries", day_log("1999-01-01"), None)
     print(f"{len(fails) == 0 and 'all' or len(fails)} {'passed' if not fails else 'failed'}")
     return 1 if fails else 0

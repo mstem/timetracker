@@ -1350,6 +1350,18 @@ def cmd_self_test() -> int:
           common.rule_activity(nk, 38, hcfg), None)
     check("a saved CTFG project with no activity does not borrow the rule's activity",
           hub_files("✳ Weekly newsletter text with Daniel", {**hmaps, nk: {"project": 38}}), (38, 53))
+    cm = {"~/projects/ctfg-curator": {"project": 38, "activity": 37}}
+    check("a folder mapped to a specific CTFG project keeps its CTFG-titled windows",
+          hub_files("✳ CTFG curator taxonomy", cm, key="~/projects/ctfg-curator"), (38, 37))
+    check("  even after the matcher saved the generic CTFG project for the title",
+          hub_files("✳ CTFG curator taxonomy",
+                    {**cm, "~/projects/ctfg-curator | ctfg curator taxonomy": {"project": 63, "activity": 76}},
+                    key="~/projects/ctfg-curator"), (38, 37))
+    check("  while a title the model put on a specific CTFG project keeps that",
+          hub_files("✳ CTFG curator taxonomy",
+                    {"~/projects/ctfg-curator": {"project": 63, "activity": 76},
+                     "~/projects/ctfg-curator | ctfg curator taxonomy": {"project": 38, "activity": 37}},
+                    key="~/projects/ctfg-curator"), (38, 37))
     check("two projects with no known customer are not the same customer",
           common.enforce_title_rule(nk, 99, hcfg, {23: 4}), 63)
     g_ctfg = {"source": "app", "key": "app:granola", "window": "Daniel / Matt weekly",

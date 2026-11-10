@@ -545,12 +545,18 @@ def resolve_mapping(key: str, mappings: dict, default_project, default_activity,
     own = mappings.get(key) or {}
     rule = title_rule(key, config)
     if rule:
-        if own.get("project") and _same_customer(own["project"], rule["project"], project_customer):
-            # The rule's activity belongs to the rule's project, so another CTFG
-            # project without its own activity takes the default instead.
-            same = own["project"] == rule["project"]
-            return own["project"], own.get("activity") or (rule.get("activity") if same else None) or default_activity
-        return rule["project"], rule.get("activity") or default_activity
+        # A specific CTFG project wins over the rule's general one: first the
+        # title's own, then its profile's or its folder's. The title's own
+        # mapping is often just the rule's project, saved when the rule
+        # overruled the model, so it ranks last.
+        base = mappings.get(key.split(TITLE_SEP, 1)[0]) or {}
+        candidates = [own, profile_mapping(key, config) or {}, base]
+        for mapping in candidates:
+            p = mapping.get("project")
+            if p and p != rule["project"] and _same_customer(p, rule["project"], project_customer):
+                return p, mapping.get("activity") or default_activity
+        return rule["project"], (own.get("activity") if own.get("project") == rule["project"] else None) \
+            or rule.get("activity") or default_activity
     base = mappings.get(key.split(TITLE_SEP, 1)[0]) or {}
     profile = profile_mapping(key, config)
     if (profile and own.get("project") and project_customer
