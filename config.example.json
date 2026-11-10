@@ -40,6 +40,7 @@
   "title_split_keys": ["chrome:internal", "chrome:newtab", "app:slack", "~", "~/projects/todoist-triage"],
   "title_split_prefixes": ["~/.claude"],
   "profile_projects": [{"suffix": "(example.org)", "project": 23, "activity": 22}],
+  "ctfg_title_rule": {"project": 63, "activity": 76},
   "context_keys": {"app:granola": {"customers": [4, 2], "fallback": {"project": 23, "activity": 22}}},
   "classifier_hints": ["A Chrome window title ending '(example.org)' is the Example Org profile: Example Org work."]
 }

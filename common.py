@@ -478,6 +478,57 @@ def profile_mapping(key: str, config: dict) -> dict:
     return {}
 
 
+# A title that names CTFG work never files under Evens, whatever folder, domain,
+# profile, saved mapping or model answer says otherwise. Evens hours feed the
+# Evens weekly report, and CTFG time there misreports the week to Evens.
+# `ctfg_title_rule` in config.json names the CTFG project to use when the
+# title's own mapping is not already a CTFG project:
+# {"project": 63, "activity": 76}. Without that key the rule is off.
+CTFG_TITLE = re.compile(
+    r"\bdaniel\b|\bctfg\b|civic\s*tech\s*field\s*guide|\bfield\s*guide\b"
+    r"|\bsuperbloom\b|\bsimply\s*secure\b", re.I)
+
+
+def title_rule(key: str, config: dict):
+    """The `ctfg_title_rule` from config when `key` is a title key whose title
+    names CTFG work, else None."""
+    rule = (config or {}).get("ctfg_title_rule")
+    if not rule or TITLE_SEP not in key:
+        return None
+    return rule if CTFG_TITLE.search(key.split(TITLE_SEP, 1)[1]) else None
+
+
+def _same_customer(project, other, project_customer: dict) -> bool:
+    if project == other:
+        return True
+    customer = (project_customer or {}).get(other)
+    return customer is not None and project_customer.get(project) == customer
+
+
+def needs_project_customer(config: dict) -> bool:
+    """Whether resolving keys needs Kimai's project-to-customer table."""
+    return bool(config.get("context_keys") or config.get("profile_projects")
+                or config.get("ctfg_title_rule"))
+
+
+def rule_activity(key: str, project, config: dict):
+    """The rule's activity when the CTFG rule put its own project on `key`,
+    so a saved mapping carries the activity the rule names. None otherwise."""
+    rule = title_rule(key, config)
+    if rule and project == rule["project"]:
+        return rule.get("activity")
+    return None
+
+
+def enforce_title_rule(key: str, project, config: dict, project_customer: dict = None):
+    """The project to save for `key`: `project` itself, unless the title names
+    CTFG work and `project` is not a CTFG project, in which case the rule's."""
+    rule = title_rule(key, config)
+    if not rule or (project and _same_customer(project, rule["project"], project_customer)):
+        return project
+    return rule["project"]
+
+
 def resolve_mapping(key: str, mappings: dict, default_project, default_activity,
                     config: dict = None, project_customer: dict = None) -> tuple:
     """(project, activity) for a Mac key. A title key with no answer of its
@@ -488,8 +539,15 @@ def resolve_mapping(key: str, mappings: dict, default_project, default_activity,
     The profile also settles the organization. A title's own mapping is kept
     when it is a project of the profile's customer (an Evens window on the
     Digital citizenry doc stays on Digital citizenry), and overruled when the
-    model put a work-profile window under another customer."""
+    model put a work-profile window under another customer.
+
+    The CTFG title rule comes before all of that."""
     own = mappings.get(key) or {}
+    rule = title_rule(key, config)
+    if rule:
+        if own.get("project") and _same_customer(own["project"], rule["project"], project_customer):
+            return own["project"], own.get("activity") or rule.get("activity") or default_activity
+        return rule["project"], rule.get("activity") or default_activity
     base = mappings.get(key.split(TITLE_SEP, 1)[0]) or {}
     profile = profile_mapping(key, config)
     if (profile and own.get("project") and project_customer
@@ -535,7 +593,9 @@ def assign_context(entries: list, config: dict, resolve, project_customer: dict)
     for e in entries:
         base = entry_key(e).split(TITLE_SEP, 1)[0]
         rule = rules.get(base)
-        if not rule:
+        if not rule or title_rule(entry_key(e), config):
+            # A title naming CTFG work goes where the CTFG rule sends it, not
+            # to the organization of the nearest work.
             out.append(e)
             continue
         customers = set(rule.get("customers", []))
@@ -588,17 +648,28 @@ def is_title_split(base_key: str, config: dict, mappings: dict) -> bool:
 def split_by_title(entries: list, config: dict, mappings: dict) -> list:
     """Re-key Mac entries under a title-split key to `<key> | <title>`. Entries
     whose title names nothing keep their base key. Returns new dicts; the log
-    entries themselves are not touched."""
+    entries themselves are not touched.
+
+    A title naming CTFG work is split out of any key, split or not, so the
+    CTFG title rule can see it: otherwise it would be summed into its folder's
+    or domain's one timesheet and filed wherever that goes."""
     out = []
     decided = {}
+    titles = {}
+    ctfg_rule = bool((config or {}).get("ctfg_title_rule"))
     for e in entries:
         base = entry_key(e)
         if base not in decided:
-            decided[base] = (TITLE_SEP not in base and not base.startswith("android:")
-                             and is_title_split(base, config, mappings))
-        if decided[base] and e.get("source") != "android":
-            title = normalize_title(e.get("window", ""))
-            if title:
+            eligible = TITLE_SEP not in base and not base.startswith("android:")
+            decided[base] = (eligible, eligible and is_title_split(base, config, mappings))
+        eligible, split = decided[base]
+        if eligible and e.get("source") != "android":
+            window = e.get("window", "")
+            if window not in titles:
+                t = normalize_title(window)
+                titles[window] = (t, bool(t and ctfg_rule and CTFG_TITLE.search(t)))
+            title, names_ctfg = titles[window]
+            if title and (split or names_ctfg):
                 e = {**e, "key": base + TITLE_SEP + title}
         out.append(e)
     return out
