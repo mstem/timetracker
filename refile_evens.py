@@ -89,6 +89,20 @@ def save_posted(ids: set, folder: str = common.BASE_DIR):
         json.dump(sorted(ids), f)
 
 
+def pick_sheet(hits: list, mins: int):
+    """The timesheet a Sent line produced, among those with its description and
+    a length within a minute of it. When those sit on different projects,
+    picking by closeness can claim the wrong one, so none is picked."""
+    if len({t["project"]["id"] for t in hits}) > 1:
+        return None
+    return min(hits, key=lambda t: abs(t["duration"] // 60 - mins))
+
+
+def movable(sheet: dict) -> bool:
+    """An exported timesheet already went into a report, so it stays put."""
+    return not sheet.get("exported")
+
+
 def day_log(day: str):
     path = os.path.join(common.LOGS_DIR, f"{day}.json")
     if not os.path.exists(path):
@@ -148,14 +162,14 @@ def plan(config: dict, first: str, last: str, keys: list, evens_project: int) ->
                 if t["id"] not in claimed and abs(t["duration"] // 60 - mins) <= 1]
         if not hits:
             continue
-        if len({t["duration"] // 60 for t in hits}) < len(hits) and len(hits) > 1:
-            # Same description and same length: either one is the right one
-            # to re-file, but only if they are on the same project.
-            if len({t["project"]["id"] for t in hits}) > 1:
-                print(f"  ! {day} '{desc}' {mins}m: {len(hits)} timesheets fit on different projects, skipped")
-                continue
-        sheet = min(hits, key=lambda t: abs(t["duration"] // 60 - mins))
+        sheet = pick_sheet(hits, mins)
+        if sheet is None:
+            print(f"  ! {day} '{desc}' {mins}m: {len(hits)} timesheets fit on different projects, skipped")
+            continue
         claimed.add(sheet["id"])
+        if not movable(sheet):
+            print(f"  ! {day} #{sheet['id']} '{desc}': exported, left as it is")
+            continue
         if project_customer.get(sheet["project"]["id"]) != evens:
             continue
         if day not in logs:
@@ -233,6 +247,21 @@ def is_gone(config: dict, sheet_id: int) -> bool:
     return False
 
 
+def saved_anyway(config: dict, body: dict, posted: list, original: int) -> list:
+    """Timesheets the lost post created: same start, project and description,
+    and neither the original nor a piece already known."""
+    known = {new.get("id") for new in posted if new} | {original}
+    try:
+        rows = common.kimai_request(
+            config, "GET", f"/timesheets?begin={body['begin']}&end={body['end']}&full=true") or []
+    except Exception:
+        return []
+    return [t for t in rows if t.get("id") not in known
+            and (t.get("project") or {}).get("id") == body["project"]
+            and (t.get("description") or "") == body["description"]
+            and (t.get("begin") or "")[:19] == body["begin"][:19]]
+
+
 def take_back(config: dict, posted: list):
     for new in posted:
         if new and new.get("id"):
@@ -283,6 +312,8 @@ def apply(config: dict, moves: list, snapshot_dir: str = common.BASE_DIR):
             try:
                 posted.append(common.kimai_request(config, "POST", "/timesheets", body))
             except Exception:
+                # A post that timed out may still have saved; find it so it goes too.
+                posted += saved_anyway(config, body, posted, m["sheet"]["id"])
                 take_back(config, posted)
                 print(f"  #{m['sheet']['id']} {m['day']}: a piece was rejected, left as it was; stopping")
                 raise
@@ -406,6 +437,31 @@ def self_test() -> int:
           load_posted(d), {701})
     check("a zero-second piece is not posted",
           len([c for c in calls if c[0] == "POST"]), 1)
+    a12 = {"id": 1, "duration": 720, "project": {"id": 23}}
+    c13 = {"id": 2, "duration": 780, "project": {"id": 63}}
+    check("two timesheets on different projects that both fit are skipped", pick_sheet([a12, c13], 12), None)
+    check("  one that fits alone is picked", pick_sheet([a12], 12), a12)
+    check("an exported timesheet is not moved", movable({"exported": True}), False)
+    calls.clear()
+    d = tempfile.mkdtemp()
+    def post_times_out(config, method, path, body=None):
+        calls.append((method, path))
+        if method == "POST":
+            raise TimeoutError("timed out")
+        if method == "GET" and path.startswith("/timesheets?"):
+            return [{"id": 801, "project": {"id": 63}, "description": "a", "begin": "2026-01-01T10:00:00+0000"},
+                    {"id": 7, "project": {"id": 63}, "description": "a", "begin": "2026-01-01T10:00:00+0000"},
+                    {"id": 803, "project": {"id": 63}, "description": "a", "begin": "2026-01-01T10:05:00+0000"},
+                    {"id": 802, "project": {"id": 23}, "description": "other", "begin": "2026-01-01T10:00:00+0000"}]
+    common.kimai_request = post_times_out
+    try:
+        apply({"timezone": "UTC"}, [move], snapshot_dir=d)
+    except Exception:
+        pass
+    finally:
+        common.kimai_request = real
+    check("a post that timed out but saved is found and taken back out, never the original",
+          [c for c in calls if c[0] == "DELETE"], [("DELETE", "/timesheets/801")])
     check("a day with no log file gives no entries", day_log("1999-01-01"), None)
     print(f"{len(fails) == 0 and 'all' or len(fails)} {'passed' if not fails else 'failed'}")
     return 1 if fails else 0
