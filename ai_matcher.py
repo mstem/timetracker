@@ -552,7 +552,7 @@ def cmd_match(days: int, dry_run: bool, interactive: bool):
             if result:
                 activity_id = common.rule_activity(key, result["id"], config) or resolve_activity(result["id"])
                 if activity_id:
-                    to_save[key] = {"project": result["id"], "activity": activity_id}
+                    to_save[key] = {"project": result["id"], "activity": activity_id, "manual": True}
                     log.info(f"Matched '{key}' → {result['name']} (interactive)")
                 else:
                     to_save.pop(key, None)
@@ -621,7 +621,7 @@ def cmd_link(key: str, project_name_query: str):
         sys.exit(1)
 
     mappings = common.load_project_mappings()
-    mappings[key] = {"project": found["id"], "activity": activity_id}
+    mappings[key] = {"project": found["id"], "activity": activity_id, "manual": True}
     common.save_project_mappings(mappings)
     print(f"Mapped '{key}'  →  {found['name']}  (project {found['id']}, activity {activity_id})")
     log.info(f"Linked '{key}' → {found['name']} via --link")

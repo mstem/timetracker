@@ -293,7 +293,7 @@ def append_activity(path: str, activity: ActivityState, start: datetime.datetime
 def cmd_map(key: str, project_id: str, activity_id: str):
     key = common.normalize_key(key)
     mappings = common.load_project_mappings()
-    mappings[key] = {"project": int(project_id), "activity": int(activity_id)}
+    mappings[key] = {"project": int(project_id), "activity": int(activity_id), "manual": True}
     common.save_project_mappings(mappings)
     print(f"Mapped '{key}' → project {project_id}, activity {activity_id}")
 
@@ -1362,6 +1362,17 @@ def cmd_self_test() -> int:
                     {"~/projects/ctfg-curator": {"project": 63, "activity": 76},
                      "~/projects/ctfg-curator | ctfg curator taxonomy": {"project": 38, "activity": 37}},
                     key="~/projects/ctfg-curator"), (38, 37))
+    check("a mapping set by hand beats the CTFG rule",
+          hub_files("✳ Weekly newsletter text with Daniel",
+                    {**hmaps, nk: {"project": 23, "activity": 22, "manual": True}}), (23, 22))
+    check("  while the same mapping saved by the model does not",
+          hub_files("✳ Weekly newsletter text with Daniel",
+                    {**hmaps, nk: {"project": 23, "activity": 22}}), (63, 76))
+    check("the hand-set mark survives loading and saving the mappings file",
+          common.normalize_mapping_value({"project": 23, "activity": 22, "manual": True}),
+          {"project": 23, "activity": 22, "manual": True})
+    check("  and stays off mappings that never had it",
+          common.normalize_mapping_value({"project": 23, "activity": 22}), {"project": 23, "activity": 22})
     check("two projects with no known customer are not the same customer",
           common.enforce_title_rule(nk, 99, hcfg, {23: 4}), 63)
     g_ctfg = {"source": "app", "key": "app:granola", "window": "Daniel / Matt weekly",
