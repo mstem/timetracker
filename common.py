@@ -477,12 +477,18 @@ _MAIL_TAIL = re.compile(r"\s+-\s+[\w.+-]+@[\w.-]+(\s+-\s+.*)?$")
 _SLACK = re.compile(r"^(?:\*\s*)?(.+?)\s+\((DM|Channel)\)\s+-\s+.*-\s+Slack$|^(?:\*\s*)?(.+?)\s+-\s+.*-\s+Slack$")
 # Anything that may carry a code someone sent to sign in. This fails closed: a
 # one-time-password word drops the title outright, and so does a 4-8 digit
-# number (years aside) within a few words of "code", "sign in", "log in" or
-# "verify", in either order. A work title that only mentions codes and has no
-# such number ("Access code review") stays.
+# number (years aside) within a few words of "code", "PIN", "password",
+# "token", "security", "sign in", "log in", "confirm" or "verify", in either
+# order, and any number said outright as one ("code: 2024", "is your"). A
+# work title that only mentions codes and has no such number ("Access code
+# review") stays.
 _CODE_NUMBER = r"\b(?!(?:19|20)\d\d\b)\d{4,8}\b"
-_CODE_WORD = r"\b(?:codes?|sign[- ]?in|log[- ]?in|verif\w*)\b"
+_CODE_WORD = (r"\b(?:codes?|pins?|tokens?|passwords?|security|auth\w*|confirm\w*"
+              r"|sign[- ]?in|log[- ]?in|verif\w*)\b")
 _SECRET = re.compile(r"\b(otp|passcode|2fa|mfa|one[- ]time password)\b"
+                     # Said outright, a year-shaped number is a code too.
+                     r"|\b(code|pin|otp|passcode|password|token)\s*(is|:)\s*\d{4,8}\b"
+                     r"|\b\d{4,8}\s+is\s+your\b"
                      rf"|{_CODE_WORD}\W+(?:\w+\W+){{0,6}}?{_CODE_NUMBER}"
                      rf"|{_CODE_NUMBER}\W+(?:\w+\W+){{0,6}}?{_CODE_WORD}"
                      r"|[?&](token|code|key|auth|sig|signature|password|secret)=", re.I)

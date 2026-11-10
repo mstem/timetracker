@@ -1501,6 +1501,9 @@ def cmd_self_test() -> int:
           ct("Your sign in code for Evens Foundation is 168622 - matt.stempeck@evensfoundation.eu - Stichting Evens Mail - Google Chrome - Matt (evensfoundation.eu)"), "")
     for secret in ("Your verification code is 482913", "123456 is your Google verification code",
                    "Use 482913 to sign in to Evens", "Your code for Evens Foundation: 4821",
+                   "Your PIN is 4821", "482913 is your security number", "Your code is 2024",
+                   "Code: 1999 - Google Chrome - Matt", "Password reset 48213 - Google Chrome - Matt",
+                   "Confirmation number 482913 for login",
                    "Your OTP - Google Chrome - Matt", "Passcode for the board meeting",
                    "2FA backup codes 48213 91822 - Google Chrome - Matt",
                    "Reset link https://example.com/reset?token=abc123def - Google Chrome - Matt"):
