@@ -167,10 +167,10 @@ def plan(config: dict, first: str, last: str, keys: list, evens_project: int) ->
             print(f"  ! {day} '{desc}' {mins}m: {len(hits)} timesheets fit on different projects, skipped")
             continue
         claimed.add(sheet["id"])
+        if project_customer.get(sheet["project"]["id"]) != evens:
+            continue
         if not movable(sheet):
             print(f"  ! {day} #{sheet['id']} '{desc}': exported, left as it is")
-            continue
-        if project_customer.get(sheet["project"]["id"]) != evens:
             continue
         if day not in logs:
             logs[day] = day_log(day)
@@ -208,9 +208,10 @@ def plan(config: dict, first: str, last: str, keys: list, evens_project: int) ->
             p["seconds"] += sheet["duration"] * e["seconds"] / total
             p["titles"][e.get("window", "")] += e["seconds"]
             p["start"] = min(p["start"] or e["start"], e["start"])
-        if sum(p["seconds"] for t, p in pieces.items() if t != current) < 30:
-            continue
         whole_seconds = dict(zip(pieces, split_seconds(sheet["duration"], [p["seconds"] for p in pieces.values()])))
+        # Checked after slivers fold, so a move that rounds to nothing is no move.
+        if sum(x for t, x in whole_seconds.items() if t != current) < 30:
+            continue
         out.append({"sheet": sheet, "key": key, "day": day, "pieces": [
             {"project": proj, "activity": act, "project_name": names.get(proj, str(proj)),
              "seconds": whole_seconds[(proj, act)], "start": p["start"],
@@ -264,10 +265,19 @@ def saved_anyway(config: dict, body: dict, posted: list, original: int) -> list:
             and (t.get("begin") or "")[:19] == body["begin"][:19]]
 
 
-def take_back(config: dict, posted: list):
+def take_back(config: dict, posted: list, folder: str = common.BASE_DIR):
+    """Delete the pieces just posted. Any that will not go are recorded as
+    posted, so a later run leaves them alone, and named for a person to remove."""
+    stuck = []
     for new in posted:
         if new and new.get("id"):
-            common.kimai_request(config, "DELETE", f"/timesheets/{new['id']}")
+            try:
+                common.kimai_request(config, "DELETE", f"/timesheets/{new['id']}")
+            except Exception:
+                stuck.append(new["id"])
+    if stuck:
+        save_posted(load_posted(folder) | set(stuck), folder)
+        print(f"  could not take back {stuck}; delete them in Kimai by hand")
 
 
 def split_seconds(duration: int, weights: list) -> list:
@@ -316,7 +326,7 @@ def apply(config: dict, moves: list, snapshot_dir: str = common.BASE_DIR):
             except Exception:
                 # A post that timed out may still have saved; find it so it goes too.
                 posted += saved_anyway(config, body, posted, m["sheet"]["id"])
-                take_back(config, posted)
+                take_back(config, posted, snapshot_dir)
                 print(f"  #{m['sheet']['id']} {m['day']}: a piece was rejected, left as it was; stopping")
                 raise
         try:
@@ -339,7 +349,7 @@ def apply(config: dict, moves: list, snapshot_dir: str = common.BASE_DIR):
                 print(f"  #{m['sheet']['id']} {m['day']} re-filed into {len(posted)} timesheet(s)")
                 continue
             # The original is still there, so its pieces would count the time twice.
-            take_back(config, posted)
+            take_back(config, posted, snapshot_dir)
             print(f"  #{m['sheet']['id']} {m['day']}: could not delete the original, its pieces taken back; stopping")
             raise
         done |= {new["id"] for new in posted if new and new.get("id")}
@@ -495,6 +505,17 @@ def self_test() -> int:
         common.kimai_request = real
     check("when Kimai cannot say whether the original is gone, the new pieces stay",
           [c for c in calls if c == ("DELETE", "/timesheets/901")], [])
+    d = tempfile.mkdtemp()
+    def rollback_fails(config, method, path, body=None):
+        if method == "DELETE":
+            raise TimeoutError("timed out")
+    common.kimai_request = rollback_fails
+    try:
+        take_back({}, [{"id": 951}], d)
+    finally:
+        common.kimai_request = real
+    check("a piece that cannot be taken back is recorded so later runs leave it alone",
+          load_posted(d), {951})
     check("a day with no log file gives no entries", day_log("1999-01-01"), None)
     print(f"{len(fails) == 0 and 'all' or len(fails)} {'passed' if not fails else 'failed'}")
     return 1 if fails else 0
