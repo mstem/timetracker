@@ -247,9 +247,8 @@ def log_path_for(date: datetime.date) -> str:
 
 
 def android_dates() -> set:
-    """Dates with a stored phone log. Note this only finds days already synced:
-    a day the Mac was off entirely leaves no local log to discover, so use
-    `--send DATE` by hand for those."""
+    """Dates with a stored phone log. Days the Mac was off entirely have no
+    log of either kind; Tracker._candidate_dates covers those."""
     d = common.ANDROID_LOGS_DIR
     if not os.path.isdir(d):
         return set()
@@ -1080,13 +1079,24 @@ class Tracker:
         self._reload_config()
         common.check_kimai_timezone(self.config)
         today = datetime.date.today().isoformat()
-        dates = {f[:-5] for f in os.listdir(LOGS_DIR) if f.endswith(".json")}
-        if self.config.get("android_sync_enabled"):
-            dates |= android_dates()
-        for date_str in sorted(dates):
+        logged = {f[:-5] for f in os.listdir(LOGS_DIR) if f.endswith(".json")}
+        for date_str in sorted(self._candidate_dates(logged)):
             if date_str >= today:
                 continue  # don't send today's partial log
             self._send_day(date_str)
+
+    def _candidate_dates(self, logged: set) -> set:
+        """Days worth checking for an outstanding source: every day with a Mac
+        log, plus, with the phone on, every day RescueTime can still serve.
+        A day the Mac was never opened leaves no local log, so without the
+        window its phone time would never be fetched."""
+        dates = set(logged)
+        if self.config.get("android_sync_enabled"):
+            dates |= android_dates()
+            today = datetime.date.today()
+            dates |= {(today - datetime.timedelta(days=n)).isoformat()
+                      for n in range(1, PHONE_HISTORY_DAYS + 1)}
+        return dates
 
     def _send_day(self, date_str: str):
         """Send whichever of the day's sources have not reached Kimai yet.
@@ -1229,6 +1239,22 @@ def cmd_self_test() -> int:
                 - datetime.timedelta(days=PHONE_HISTORY_DAYS + 1)).isoformat()
         check("day past the history window has aged out",
               t._phone_aged_out(gone), True)
+
+        # a day with no Mac log and no phone log still gets its phone time asked
+        # for while RescueTime can serve it
+        t.config = {"android_sync_enabled": True}
+        no_logs = (datetime.date.today() - datetime.timedelta(days=7)).isoformat()
+        cands = t._candidate_dates(set())
+        check("a no-log day inside the history window is a candidate",
+              no_logs in cands, True)
+        check("  as is the oldest fetchable day",
+              (datetime.date.today()
+               - datetime.timedelta(days=PHONE_HISTORY_DAYS)).isoformat() in cands, True)
+        check("  but not today", today in cands, False)
+        check("  nor a day past the window", gone in cands, False)
+        t.config = {"android_sync_enabled": False}
+        check("phone off: only days with logs are candidates",
+              t._candidate_dates({"1999-01-01"}), {"1999-01-01"})
 
         # settling
         t.sent_state = {}

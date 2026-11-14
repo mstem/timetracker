@@ -243,7 +243,7 @@ def classify_keys_with_claude(api_key: str, unmapped: dict, projects: list, mapp
         "Google Docs\" is specific; \"Google Calendar\" or \"Sign in - Google "
         "accounts\" is not).\n"
         "- Prefer null over a weak guess, even if some project seems plausible.\n- A project named \"General\", \"Misc\" or similar is NOT a catch-all. It belongs to the customer named before the slash, so only use it for that customer's work. A work tool that serves every project (a task manager, a terminal, a notes app) belongs to no project unless the title names the work: return null.\n"
-        "- Personal life is not miscellaneous. The 'Life' projects exist for it: reading news or articles goes to Life / Reading, messaging friends to Life / Messaging, personal finance to Life / Finances, health and fitness to Life / HEALTH, trips to Life / Travel, shopping to Life / Shopping.\n"
+        "- Personal life is not miscellaneous. The 'Life' projects exist for it: reading news or articles goes to Life / Reading, messaging friends to Life / Messaging, personal finance to Life / Finances, health and fitness to Life / Health, trips to Life / Travel, shopping to Life / Shopping.\n"
         "- A title that names an organisation's workspace, profile or window with no more specific project in it goes to that organisation's general project when it has one.\n"
         "- Every activity key in the input must appear as a key in your response.\n\n"
         "Respond with exactly this JSON structure:\n"

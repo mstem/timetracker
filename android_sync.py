@@ -71,7 +71,7 @@ CATEGORY_TARGETS = [
     (["General Shopping"],                                      "Life",      "Shopping"),
     (["General News & Opinion",
       "General Reference & Learning"],                          "Life",      "Reading"),
-    (["Health & Medicine"],                                     "Life",      "HEALTH"),
+    (["Health & Medicine"],                                     "Life",      "Health"),
     (["Browsers"],                                              "Life",      "Web browser"),
     (["Music", "General Entertainment", "Video"],               "Life",      "Relaxation"),
     (["Business & Finance"],                                    "Life",      "Finances"),
