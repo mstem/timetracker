@@ -405,7 +405,7 @@ All keys below are optional and have built-in defaults — omit any you don't ne
 Since the tracker runs silently in the background, it's easy to not notice if it stops working. Two launchd agents alert you via a Telegram bot when something's wrong:
 
 - **`watchdog_process.sh`** (every 10 min): checks whether the `com.terminaltracker` launchd job is actually running; alerts if it crashed or got unloaded.
-- **`watchdog_health.sh`** (hourly, 9am-8pm): checks that today's log file has been written to recently. Catches the case where the process is alive but silently stuck (e.g. it lost AppleScript/Accessibility permission) — something a simple "is it running" check would miss.
+- **`watchdog_health.sh`** (hourly, 9am-8pm): checks that today's log file has been written to recently, counting only time the Mac is in use (display on and keyboard or mouse input in the last 10 minutes). Time away from the Mac, such as working from a phone, never triggers it. Catches the case where the process is alive but silently stuck (e.g. it lost AppleScript/Accessibility permission) — something a simple "is it running" check would miss.
 
 ### Setup
 

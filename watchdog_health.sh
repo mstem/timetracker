@@ -4,53 +4,124 @@
 # is silently spinning). A process-alive check alone would miss this.
 # Installed as com.terminaltracker.watchdog-health (runs hourly) — see setup.sh.
 #
-# Only alerts during the day (9am-8pm) since no log activity overnight or on
-# weekends is expected, not a failure.
+# An empty or stale log is only a fault if someone is using the Mac. The Mac
+# never sleeps (caffeinate keeps it awake), so system wake time says nothing
+# about use. The signals that do:
+#   - the display is on (it turns off after `pmset displaysleep` minutes idle)
+#   - HID input within the last ACTIVE_WINDOW_MIN minutes
+# The clock for "should have logged by now" starts at whichever is latest:
+# the last log write, the moment the display last came on, or the last wake.
+# Only alerts during the day (9am-8pm).
+#
+# Every machine input has an env override so tests can drive the script:
+#   WATCHDOG_NOW, WATCHDOG_IDLE_SEC, WATCHDOG_PMSET_LOG (file),
+#   WATCHDOG_LOG_DIR, WATCHDOG_NOTIFY, WATCHDOG_STATE_FILE
+#
+# When nothing in the power log falls on today (display left on overnight, or
+# the log rotated), midnight is not time at the Mac. The script then keeps a
+# state file of the current active stretch: each check that finds input within
+# ACTIVE_WINDOW_MIN extends it if the previous check also did and ran within
+# STRETCH_GAP_MIN; otherwise the stretch restarts at this check.
+
+# pmset -g log carries device names with non-UTF-8 bytes; byte mode keeps awk
+# from aborting on them.
+export LC_ALL=C
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TODAY_LOG="$DIR/logs/$(date +%Y-%m-%d).json"
+LOG_DIR="${WATCHDOG_LOG_DIR:-$DIR/logs}"
+NOTIFY="${WATCHDOG_NOTIFY:-$DIR/notify_telegram.sh}"
+NOW="${WATCHDOG_NOW:-$(date +%s)}"
+STATE_FILE="${WATCHDOG_STATE_FILE:-$DIR/.watchdog_health_state}"
 
-HOUR=$(date +%H)
+STALE_MIN=90          # in-use minutes with no log write before alerting
+ACTIVE_WINDOW_MIN=10  # input this recent means someone is at the Mac
+STRETCH_GAP_MIN=75    # hourly schedule plus slack between checks in one stretch
+
+TODAY=$(date -r "$NOW" +%Y-%m-%d)
+TODAY_LOG="$LOG_DIR/$TODAY.json"
+HOUR=$(date -r "$NOW" +%H)
+HOUR=$((10#$HOUR))
 if [ "$HOUR" -lt 9 ] || [ "$HOUR" -ge 20 ]; then
   exit 0
 fi
 
-if [ ! -f "$TODAY_LOG" ]; then
-  # No log file yet today — only worth flagging later in the day.
-  if [ "$HOUR" -ge 12 ]; then
-    "$DIR/notify_telegram.sh" "🟡 Timetracker: no log file for today yet ($TODAY_LOG missing). It may be stuck or lost permissions."
-  fi
+# Nobody at the keyboard right now: nothing to log, nothing to alert about.
+if [ -n "${WATCHDOG_IDLE_SEC+x}" ]; then
+  IDLE_SEC="$WATCHDOG_IDLE_SEC"
+else
+  IDLE_SEC=$(ioreg -c IOHIDSystem 2>/dev/null | awk '/HIDIdleTime/ {print int($NF/1000000000); exit}')
+fi
+if [ -z "$IDLE_SEC" ]; then
+  # The idle probe is what the tracker itself depends on; if it is unreadable
+  # we cannot tell use from absence, so stay quiet rather than guess.
+  exit 0
+fi
+IDLE_MIN=$(( IDLE_SEC / 60 ))
+
+# Record this check in the active-stretch state: "<check ts> <stretch start>",
+# stretch start 0 when nobody was at the Mac.
+PREV_CHECK=0; PREV_STRETCH=0
+[ -f "$STATE_FILE" ] && read -r PREV_CHECK PREV_STRETCH < "$STATE_FILE"
+if [ "$IDLE_MIN" -ge "$ACTIVE_WINDOW_MIN" ]; then
+  echo "$NOW 0" > "$STATE_FILE"
+  exit 0
+fi
+if [ "${PREV_STRETCH:-0}" -gt 0 ] 2>/dev/null && [ $(( NOW - ${PREV_CHECK:-0} )) -le $(( STRETCH_GAP_MIN * 60 )) ]; then
+  STRETCH_TS=$PREV_STRETCH
+else
+  STRETCH_TS=$(( NOW - IDLE_SEC ))
+fi
+echo "$NOW $STRETCH_TS" > "$STATE_FILE"
+
+if [ -n "$WATCHDOG_PMSET_LOG" ]; then
+  PMSET_LOG=$(cat "$WATCHDOG_PMSET_LOG" 2>/dev/null)
+else
+  PMSET_LOG=$(pmset -g log 2>/dev/null)
+fi
+
+to_epoch() {  # "YYYY-MM-DD HH:MM:SS +ZZZZ" -> epoch seconds
+  date -j -f "%Y-%m-%d %H:%M:%S %z" "$1" +%s 2>/dev/null
+}
+
+# Display state and the moment the current on-stretch began.
+LAST_DISPLAY=$(printf '%s\n' "$PMSET_LOG" | awk '/Display is turned (on|off)/ {ts = $1 " " $2 " " $3; st = $NF} END {if (ts) print st "|" ts}')
+if [ "${LAST_DISPLAY%%|*}" = "off" ]; then
+  exit 0
+fi
+MIDNIGHT_TS=$(date -j -f "%Y-%m-%d %H:%M:%S" "$TODAY 00:00:00" +%s)
+START_TS=$MIDNIGHT_TS
+
+DISPLAY_ON_TS=""
+[ -n "$LAST_DISPLAY" ] && DISPLAY_ON_TS=$(to_epoch "${LAST_DISPLAY#*|}")
+[ -n "$DISPLAY_ON_TS" ] && [ "$DISPLAY_ON_TS" -gt "$START_TS" ] && START_TS=$DISPLAY_ON_TS
+
+# launchd runs a missed schedule on wake, so a sleep still must not count.
+LAST_WAKE=$(printf '%s\n' "$PMSET_LOG" | awk '$4 == "Wake" {ts = $1 " " $2 " " $3} END {print ts}')
+WAKE_TS=""
+[ -n "$LAST_WAKE" ] && WAKE_TS=$(to_epoch "$LAST_WAKE")
+[ -n "$WAKE_TS" ] && [ "$WAKE_TS" -gt "$START_TS" ] && START_TS=$WAKE_TS
+
+# No display-on or wake today: start from the active stretch, never midnight.
+if [ "$START_TS" -eq "$MIDNIGHT_TS" ] && [ "$STRETCH_TS" -gt "$START_TS" ]; then
+  START_TS=$STRETCH_TS
+fi
+
+if [ -f "$TODAY_LOG" ]; then
+  LAST_MODIFIED=$(stat -f %m "$TODAY_LOG")
+  [ "$LAST_MODIFIED" -gt "$START_TS" ] && START_TS=$LAST_MODIFIED
+fi
+
+# Since the tracker stopped billing idle, the current idle stretch writes
+# nothing either; don't count it.
+AGE_MIN=$(( (NOW - START_TS) / 60 - IDLE_MIN ))
+[ "$AGE_MIN" -lt 0 ] && AGE_MIN=0
+
+if [ "$AGE_MIN" -le "$STALE_MIN" ]; then
   exit 0
 fi
 
-LAST_MODIFIED=$(stat -f %m "$TODAY_LOG")
-NOW=$(date +%s)
-AGE_MIN=$(( (NOW - LAST_MODIFIED) / 60 ))
-
-# The tracker can't log while the machine is asleep, and launchd runs the whole
-# missed schedule the moment it wakes — so an overnight sleep looks exactly like
-# a stuck tracker. Only count time the machine was actually awake.
-LAST_WAKE=$(pmset -g log 2>/dev/null | awk '$4 == "Wake" {ts = $1 " " $2} END {print ts}')
-if [ -n "$LAST_WAKE" ]; then
-  WAKE_TS=$(date -j -f "%Y-%m-%d %H:%M:%S" "$LAST_WAKE" +%s 2>/dev/null)
-  if [ -n "$WAKE_TS" ]; then
-    AWAKE_MIN=$(( (NOW - WAKE_TS) / 60 ))
-    if [ "$AWAKE_MIN" -lt "$AGE_MIN" ]; then
-      AGE_MIN=$AWAKE_MIN
-    fi
-  fi
-fi
-
-# Same problem for idle time while awake: since the tracker stopped billing
-# idle, a long stretch away from the keyboard writes nothing to the log and
-# looks exactly like a stuck tracker. Discount however long input has been idle.
-IDLE_SEC=$(ioreg -c IOHIDSystem 2>/dev/null | awk '/HIDIdleTime/ {print int($NF/1000000000); exit}')
-if [ -n "$IDLE_SEC" ]; then
-  IDLE_MIN=$(( IDLE_SEC / 60 ))
-  AGE_MIN=$(( AGE_MIN - IDLE_MIN ))
-  [ "$AGE_MIN" -lt 0 ] && AGE_MIN=0
-fi
-
-if [ "$AGE_MIN" -gt 90 ]; then
-  "$DIR/notify_telegram.sh" "🟡 Timetracker: today's log hasn't updated in ${AGE_MIN} minutes. It may be stuck (e.g. lost Accessibility/AppleScript permission)."
+if [ ! -f "$TODAY_LOG" ]; then
+  "$NOTIFY" "🟡 Timetracker: no log file for today after ${AGE_MIN} minutes of Mac use ($TODAY_LOG missing). It may be stuck or lost permissions."
+else
+  "$NOTIFY" "🟡 Timetracker: today's log hasn't updated in ${AGE_MIN} minutes of Mac use. It may be stuck (e.g. lost Accessibility/AppleScript permission)."
 fi
