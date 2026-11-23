@@ -40,6 +40,7 @@ class WatchdogHealthTest(unittest.TestCase):
             f.write(f'#!/bin/bash\necho "$1" >> "{self.sent}"\n')
         os.chmod(self.notify, 0o755)
         self.pmset = os.path.join(self.tmp.name, "pmset.log")
+        self.state = os.path.join(self.tmp.name, "state")
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -48,6 +49,10 @@ class WatchdogHealthTest(unittest.TestCase):
         with open(self.pmset, "w") as f:
             for hhmm, event in pmset_events:
                 f.write(pmset_line(hhmm, event))
+        extra = getattr(self, "_extra", None)
+        if extra:
+            with open(self.pmset, "ab") as f, open(extra, "rb") as g:
+                f.write(g.read())
         if log_mtime is not None:
             path = os.path.join(self.logs, f"{DAY}.json")
             with open(path, "w") as f:
@@ -60,6 +65,8 @@ class WatchdogHealthTest(unittest.TestCase):
             WATCHDOG_PMSET_LOG=self.pmset,
             WATCHDOG_LOG_DIR=self.logs,
             WATCHDOG_NOTIFY=self.notify,
+            WATCHDOG_STATE_FILE=self.state,
+            LANG="en_US.UTF-8",
         )
         subprocess.run(["/bin/bash", SCRIPT], env=env, check=True)
         if not os.path.exists(self.sent):
@@ -123,6 +130,42 @@ class WatchdogHealthTest(unittest.TestCase):
             ("09:00", "Display is turned on"),
         ])
         self.assertEqual(alerts, [])
+
+    def test_no_alert_when_no_display_event_today_and_user_just_sat_down(self):
+        # Display stayed on overnight (or the pmset log rotated): no display-on
+        # or wake event today. Midnight must not count as time at the Mac.
+        alerts = self.run_watchdog("09:05", idle_sec=10, pmset_events=[])
+        self.assertEqual(alerts, [])
+
+    def test_no_alert_when_no_event_today_and_stale_log_from_earlier(self):
+        alerts = self.run_watchdog("11:05", idle_sec=10, log_mtime="07:00", pmset_events=[])
+        self.assertEqual(alerts, [])
+
+    def test_no_event_today_alerts_once_in_use_long_enough(self):
+        # With no display-on event, consecutive hourly checks that each find
+        # Matt at the Mac build up in-use time until a genuine failure shows.
+        self.assertEqual(self.run_watchdog("10:00", idle_sec=10, pmset_events=[]), [])
+        self.assertEqual(self.run_watchdog("11:00", idle_sec=10, pmset_events=[]), [])
+        alerts = self.run_watchdog("12:00", idle_sec=10, pmset_events=[])
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("no log file for today", alerts[0])
+
+    def test_no_event_today_idle_check_resets_stretch(self):
+        self.run_watchdog("10:00", idle_sec=10, pmset_events=[])
+        self.run_watchdog("11:00", idle_sec=30 * 60, pmset_events=[])  # away
+        self.assertEqual(self.run_watchdog("12:00", idle_sec=10, pmset_events=[]), [])
+
+    def test_non_utf8_bytes_in_pmset_log_do_not_hide_display_state(self):
+        # Real pmset logs carry device names with stray non-UTF-8 bytes. The
+        # display-on at 09:00 must still be read, so a genuine failure alerts.
+        bad = b"2026-11-23 09:10:00 +0000 HID  \t\xe2\x80s Magic Trackpad eventType:11\n"
+        with open(self.pmset + ".extra", "wb") as f:
+            f.write(bad)
+        self._extra = self.pmset + ".extra"
+        alerts = self.run_watchdog("12:42", idle_sec=10, pmset_events=[
+            ("09:00", "Display is turned on"),
+        ])
+        self.assertEqual(len(alerts), 1)
 
     def test_no_alert_outside_working_hours(self):
         alerts = self.run_watchdog("21:00", idle_sec=0, pmset_events=[

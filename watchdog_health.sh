@@ -15,15 +15,27 @@
 #
 # Every machine input has an env override so tests can drive the script:
 #   WATCHDOG_NOW, WATCHDOG_IDLE_SEC, WATCHDOG_PMSET_LOG (file),
-#   WATCHDOG_LOG_DIR, WATCHDOG_NOTIFY
+#   WATCHDOG_LOG_DIR, WATCHDOG_NOTIFY, WATCHDOG_STATE_FILE
+#
+# When nothing in the power log falls on today (display left on overnight, or
+# the log rotated), midnight is not time at the Mac. The script then keeps a
+# state file of the current active stretch: each check that finds input within
+# ACTIVE_WINDOW_MIN extends it if the previous check also did and ran within
+# STRETCH_GAP_MIN; otherwise the stretch restarts at this check.
+
+# pmset -g log carries device names with non-UTF-8 bytes; byte mode keeps awk
+# from aborting on them.
+export LC_ALL=C
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="${WATCHDOG_LOG_DIR:-$DIR/logs}"
 NOTIFY="${WATCHDOG_NOTIFY:-$DIR/notify_telegram.sh}"
 NOW="${WATCHDOG_NOW:-$(date +%s)}"
+STATE_FILE="${WATCHDOG_STATE_FILE:-$DIR/.watchdog_health_state}"
 
 STALE_MIN=90          # in-use minutes with no log write before alerting
 ACTIVE_WINDOW_MIN=10  # input this recent means someone is at the Mac
+STRETCH_GAP_MIN=75    # hourly schedule plus slack between checks in one stretch
 
 TODAY=$(date -r "$NOW" +%Y-%m-%d)
 TODAY_LOG="$LOG_DIR/$TODAY.json"
@@ -45,9 +57,21 @@ if [ -z "$IDLE_SEC" ]; then
   exit 0
 fi
 IDLE_MIN=$(( IDLE_SEC / 60 ))
+
+# Record this check in the active-stretch state: "<check ts> <stretch start>",
+# stretch start 0 when nobody was at the Mac.
+PREV_CHECK=0; PREV_STRETCH=0
+[ -f "$STATE_FILE" ] && read -r PREV_CHECK PREV_STRETCH < "$STATE_FILE"
 if [ "$IDLE_MIN" -ge "$ACTIVE_WINDOW_MIN" ]; then
+  echo "$NOW 0" > "$STATE_FILE"
   exit 0
 fi
+if [ "${PREV_STRETCH:-0}" -gt 0 ] 2>/dev/null && [ $(( NOW - ${PREV_CHECK:-0} )) -le $(( STRETCH_GAP_MIN * 60 )) ]; then
+  STRETCH_TS=$PREV_STRETCH
+else
+  STRETCH_TS=$(( NOW - IDLE_SEC ))
+fi
+echo "$NOW $STRETCH_TS" > "$STATE_FILE"
 
 if [ -n "$WATCHDOG_PMSET_LOG" ]; then
   PMSET_LOG=$(cat "$WATCHDOG_PMSET_LOG" 2>/dev/null)
@@ -64,7 +88,8 @@ LAST_DISPLAY=$(printf '%s\n' "$PMSET_LOG" | awk '/Display is turned (on|off)/ {t
 if [ "${LAST_DISPLAY%%|*}" = "off" ]; then
   exit 0
 fi
-START_TS=$(date -j -f "%Y-%m-%d %H:%M:%S" "$TODAY 00:00:00" +%s)
+MIDNIGHT_TS=$(date -j -f "%Y-%m-%d %H:%M:%S" "$TODAY 00:00:00" +%s)
+START_TS=$MIDNIGHT_TS
 
 DISPLAY_ON_TS=""
 [ -n "$LAST_DISPLAY" ] && DISPLAY_ON_TS=$(to_epoch "${LAST_DISPLAY#*|}")
@@ -75,6 +100,11 @@ LAST_WAKE=$(printf '%s\n' "$PMSET_LOG" | awk '$4 == "Wake" {ts = $1 " " $2 " " $
 WAKE_TS=""
 [ -n "$LAST_WAKE" ] && WAKE_TS=$(to_epoch "$LAST_WAKE")
 [ -n "$WAKE_TS" ] && [ "$WAKE_TS" -gt "$START_TS" ] && START_TS=$WAKE_TS
+
+# No display-on or wake today: start from the active stretch, never midnight.
+if [ "$START_TS" -eq "$MIDNIGHT_TS" ] && [ "$STRETCH_TS" -gt "$START_TS" ]; then
+  START_TS=$STRETCH_TS
+fi
 
 if [ -f "$TODAY_LOG" ]; then
   LAST_MODIFIED=$(stat -f %m "$TODAY_LOG")
